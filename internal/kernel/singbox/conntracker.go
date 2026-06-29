@@ -330,9 +330,7 @@ func (t *ConnTracker) RoutedConnection(
 		lim = (*slf)(uuid)
 	}
 
-	destHost, destPort := destFromMeta(metadata)
-
-	return &trackedConn{
+	tc := &trackedConn{
 		Conn:     conn,
 		tracker:  t,
 		us:       us,
@@ -341,10 +339,13 @@ func (t *ConnTracker) RoutedConnection(
 		sourceIP: sourceIP,
 		limiter:  lim,
 		ctx:      ctx,
-		destHost: destHost,
-		destPort: destPort,
-		startAt:  time.Now(),
 	}
+	// 仅在开启访问日志时才提取目标/记录起始时间，关闭时无额外开销
+	if t.accessEnabled.Load() {
+		tc.destHost, tc.destPort = destFromMeta(metadata)
+		tc.startAt = time.Now()
+	}
+	return tc
 }
 
 // RoutedPacketConnection wraps UDP with per-user counting (UDP not in connMap).
@@ -387,9 +388,7 @@ func (t *ConnTracker) RoutedPacketConnection(
 		lim = (*slf)(uuid)
 	}
 
-	destHost, destPort := destFromMeta(metadata)
-
-	return &trackedPacketConn{
+	tc := &trackedPacketConn{
 		PacketConn: conn,
 		tracker:    t,
 		us:         us,
@@ -398,10 +397,12 @@ func (t *ConnTracker) RoutedPacketConnection(
 		sourceIP:   sourceIP,
 		limiter:    lim,
 		ctx:        ctx,
-		destHost:   destHost,
-		destPort:   destPort,
-		startAt:    time.Now(),
 	}
+	if t.accessEnabled.Load() {
+		tc.destHost, tc.destPort = destFromMeta(metadata)
+		tc.startAt = time.Now()
+	}
+	return tc
 }
 
 // checkDeviceGate rejects connections exceeding device limit.

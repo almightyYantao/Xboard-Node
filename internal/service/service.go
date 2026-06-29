@@ -63,8 +63,6 @@ type Service struct {
 	// pushActive prevents overlapping push/pull goroutines.
 	pushActive atomic.Bool
 	pullActive atomic.Bool
-	// updating guards against launching multiple self-update processes.
-	updating atomic.Bool
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
@@ -1087,11 +1085,16 @@ func (s *Service) pushAccessLogAsync() {
 	}()
 }
 
+// globalSelfUpdate 是进程级（而非单个 Service）的自更新互斥。机器模式下一个进程跑多个
+// 节点实例，它们共用同一个二进制；任一实例触发升级即重启整进程，所以必须全进程只跑一次。
+var globalSelfUpdate atomic.Bool
+
 // triggerSelfUpdate launches `xbctl upgrade` detached from this service's systemd
 // cgroup (via systemd-run --scope), so the upgrade's `systemctl restart` doesn't
-// kill the upgrade process itself. Guarded so only one runs at a time.
+// kill the upgrade process itself. Process-wide guarded: in machine mode multiple
+// node instances share one binary, only one upgrade may run.
 func (s *Service) triggerSelfUpdate(targetVersion string) {
-	if !s.updating.CompareAndSwap(false, true) {
+	if !globalSelfUpdate.CompareAndSwap(false, true) {
 		return
 	}
 	nlog.Core().Warn("self-update requested by panel", "from", agentVersion, "to", targetVersion)
@@ -1099,7 +1102,7 @@ func (s *Service) triggerSelfUpdate(targetVersion string) {
 		"xbctl", "upgrade", "--version", targetVersion)
 	if err := cmd.Start(); err != nil {
 		nlog.Core().Error("self-update launch failed", "error", err)
-		s.updating.Store(false)
+		globalSelfUpdate.Store(false)
 		return
 	}
 	// 不 Wait：升级进程在独立 scope 里跑，会重启本服务（本进程随之退出）

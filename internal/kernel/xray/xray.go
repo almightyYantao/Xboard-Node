@@ -272,6 +272,13 @@ func (x *Xray) SetDeviceLimitFunc(_ func(string) (int, bool)) {}
 // UpdateGlobalDevices is a no-op for xray — xray handles device limits differently.
 func (x *Xray) UpdateGlobalDevices(_ map[int][]string) {}
 
+// SetAccessLogEnabled is a no-op for xray — access logging is only implemented
+// in the sing-box kernel for now.
+func (x *Xray) SetAccessLogEnabled(_ bool) {}
+
+// DrainAccessLog returns nil for xray (no access-log capture).
+func (x *Xray) DrainAccessLog() []model.AccessRecord { return nil }
+
 // ClearGlobalDevices is a no-op for xray.
 func (x *Xray) ClearGlobalDevices() {}
 

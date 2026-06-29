@@ -213,6 +213,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 		case <-reportTicker.C:
 			s.pushReportAsync()
+			s.pushAccessLogAsync()
 
 		case <-deviceReportTicker.C:
 			s.reportDevices()
@@ -248,6 +249,7 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	// Register speed limit lookup with kernel unconditionally (before push/poll branch).
 	s.kernel.SetSpeedLimitFunc(s.speedTracker.GetLimiter)
 	s.kernel.SetDeviceLimitFunc(s.limiter.GetDeviceLimitByUUID)
+	s.kernel.SetAccessLogEnabled(s.cfg.Node.AccessLog)
 
 	bootstrap, err := s.source.Initial(ctx, s.wsMetrics, s.wsEvents, s.wsStatusCh)
 	if err != nil {
@@ -1015,6 +1017,47 @@ func (s *Service) pushReportSync() {
 	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 		nlog.Core().Warn("failed to push final report", "error", err)
 	}
+}
+
+// accessLogPusher is the optional capability a control plane exposes to forward
+// per-connection access records. Only the panel control plane implements it.
+type accessLogPusher interface {
+	PushAccessLog(records []map[string]any) error
+}
+
+// pushAccessLogAsync drains buffered access records from the kernel and forwards
+// them to the panel in a background goroutine. Best-effort: dropped on failure.
+func (s *Service) pushAccessLogAsync() {
+	if !s.cfg.Node.AccessLog {
+		return
+	}
+	pusher, ok := s.sink.(accessLogPusher)
+	if !ok {
+		return
+	}
+	records := s.kernel.DrainAccessLog()
+	if len(records) == 0 {
+		return
+	}
+	logs := make([]map[string]any, 0, len(records))
+	for _, r := range records {
+		logs = append(logs, map[string]any{
+			"time":           r.Time,
+			"user_id":        r.UserID,
+			"source_ip":      r.SourceIP,
+			"dest_host":      r.DestHost,
+			"dest_port":      r.DestPort,
+			"network":        r.Network,
+			"upload_bytes":   r.Upload,
+			"download_bytes": r.Download,
+			"duration_ms":    r.DurationMs,
+		})
+	}
+	go func() {
+		if err := pusher.PushAccessLog(logs); err != nil {
+			nlog.Core().Warn("failed to push access log", "error", err, "records", len(logs))
+		}
+	}()
 }
 
 // buildMetrics aggregates node-level metrics to be reported to the panel.

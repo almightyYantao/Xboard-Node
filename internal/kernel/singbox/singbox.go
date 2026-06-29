@@ -61,6 +61,26 @@ type SingBox struct {
 	// trackerRegistered prevents duplicate AppendTracker calls on the same
 	// Router instance during Reload. Reset to false on full restart.
 	trackerRegistered bool
+
+	// accessLogEnabled is forwarded to every freshly created ConnTracker.
+	accessLogEnabled bool
+}
+
+// SetAccessLogEnabled toggles per-connection access logging on the live tracker
+// and remembers the setting for trackers created on future restarts.
+func (s *SingBox) SetAccessLogEnabled(enabled bool) {
+	s.accessLogEnabled = enabled
+	if s.connTracker != nil {
+		s.connTracker.SetAccessLogEnabled(enabled)
+	}
+}
+
+// DrainAccessLog returns and clears buffered access records from the live tracker.
+func (s *SingBox) DrainAccessLog() []model.AccessRecord {
+	if s.connTracker != nil {
+		return s.connTracker.DrainAccessLog()
+	}
+	return nil
 }
 
 func New(cfg config.KernelConfig) *SingBox {
@@ -148,6 +168,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	if s.deviceLimitFunc != nil {
 		s.connTracker.SetDeviceLimitFunc(s.deviceLimitFunc)
 	}
+	s.connTracker.SetAccessLogEnabled(s.accessLogEnabled)
 
 	s.trackerRegistered = false
 	s.registerTracker(ctx)

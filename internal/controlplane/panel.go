@@ -109,6 +109,12 @@ func (p *PanelControlPlane) Report(payload ReportPayload) error {
 	return p.client.Report(payload.Traffic, payload.Alive, payload.Online, payload.CPU, payload.Mem, payload.Swap, payload.Disk, payload.Metrics)
 }
 
+// PushAccessLog forwards a batch of access records to the panel. Discovered via
+// an optional interface assertion in the service layer (not part of Sink).
+func (p *PanelControlPlane) PushAccessLog(records []map[string]any) error {
+	return p.client.PushAccessLog(records)
+}
+
 func (p *PanelControlPlane) ReportDevices(push PushClient, devices map[int][]string) {
 	if push != nil {
 		push.SendDeviceReport(devices)

@@ -15,8 +15,13 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/time/rate"
 
+	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
+
+// accessBufMax caps the in-memory access-log buffer; excess records are dropped
+// to bound memory if the panel push falls behind.
+const accessBufMax = 50000
 
 // ipPool caches ipSnapshot maps to reduce allocations.
 var ipPool = sync.Pool{
@@ -139,6 +144,85 @@ type ConnTracker struct {
 	globalDevices    map[int]map[string]bool // userID → IP → exists
 	globalMu         sync.RWMutex
 	globalLastUpdate time.Time
+
+	// Access logging (per-connection domain/dest capture). Off by default.
+	accessEnabled atomic.Bool
+	accessMu      sync.Mutex
+	accessBuf     []model.AccessRecord
+	accessDropped atomic.Int64
+}
+
+// SetAccessLogEnabled toggles per-connection access logging.
+func (t *ConnTracker) SetAccessLogEnabled(enabled bool) {
+	t.accessEnabled.Store(enabled)
+}
+
+// recordAccess appends one access record, dropping (counted) when the buffer is full.
+func (t *ConnTracker) recordAccess(r model.AccessRecord) {
+	t.accessMu.Lock()
+	if len(t.accessBuf) >= accessBufMax {
+		t.accessMu.Unlock()
+		if n := t.accessDropped.Add(1); n%1000 == 1 {
+			nlog.Core().Warn("access log buffer full, dropping records", "dropped", n)
+		}
+		return
+	}
+	t.accessBuf = append(t.accessBuf, r)
+	t.accessMu.Unlock()
+}
+
+// DrainAccessLog returns and clears all buffered access records.
+func (t *ConnTracker) DrainAccessLog() []model.AccessRecord {
+	t.accessMu.Lock()
+	out := t.accessBuf
+	t.accessBuf = nil
+	t.accessMu.Unlock()
+	return out
+}
+
+// emitAccess builds a record from a finished TCP connection (called on Close).
+func (t *ConnTracker) emitAccess(c *trackedConn) {
+	if !t.accessEnabled.Load() || c == nil || c.destHost == "" || c.us == nil {
+		return
+	}
+	t.recordAccess(model.AccessRecord{
+		Time:       time.Now().UnixMilli(),
+		UserID:     c.userID,
+		SourceIP:   c.sourceIP,
+		DestHost:   c.destHost,
+		DestPort:   c.destPort,
+		Network:    "tcp",
+		Upload:     c.connUp.Load(),
+		Download:   c.connDown.Load(),
+		DurationMs: time.Since(c.startAt).Milliseconds(),
+	})
+}
+
+// emitAccessPacket builds a record from a finished UDP connection (called on Close).
+func (t *ConnTracker) emitAccessPacket(c *trackedPacketConn) {
+	if !t.accessEnabled.Load() || c == nil || c.destHost == "" || c.us == nil {
+		return
+	}
+	t.recordAccess(model.AccessRecord{
+		Time:       time.Now().UnixMilli(),
+		UserID:     c.userID,
+		SourceIP:   c.sourceIP,
+		DestHost:   c.destHost,
+		DestPort:   c.destPort,
+		Network:    "udp",
+		Upload:     c.connUp.Load(),
+		Download:   c.connDown.Load(),
+		DurationMs: time.Since(c.startAt).Milliseconds(),
+	})
+}
+
+// destFromMeta extracts the requested target (domain preferred, else IP) and port.
+func destFromMeta(metadata adapter.InboundContext) (string, int) {
+	host := metadata.Destination.Fqdn
+	if host == "" && metadata.Destination.Addr.IsValid() {
+		host = metadata.Destination.Addr.String()
+	}
+	return host, int(metadata.Destination.Port)
 }
 
 // NewConnTracker creates a tracker.
@@ -246,6 +330,8 @@ func (t *ConnTracker) RoutedConnection(
 		lim = (*slf)(uuid)
 	}
 
+	destHost, destPort := destFromMeta(metadata)
+
 	return &trackedConn{
 		Conn:     conn,
 		tracker:  t,
@@ -255,6 +341,9 @@ func (t *ConnTracker) RoutedConnection(
 		sourceIP: sourceIP,
 		limiter:  lim,
 		ctx:      ctx,
+		destHost: destHost,
+		destPort: destPort,
+		startAt:  time.Now(),
 	}
 }
 
@@ -298,6 +387,8 @@ func (t *ConnTracker) RoutedPacketConnection(
 		lim = (*slf)(uuid)
 	}
 
+	destHost, destPort := destFromMeta(metadata)
+
 	return &trackedPacketConn{
 		PacketConn: conn,
 		tracker:    t,
@@ -307,6 +398,9 @@ func (t *ConnTracker) RoutedPacketConnection(
 		sourceIP:   sourceIP,
 		limiter:    lim,
 		ctx:        ctx,
+		destHost:   destHost,
+		destPort:   destPort,
+		startAt:    time.Now(),
 	}
 }
 
@@ -567,6 +661,13 @@ type trackedConn struct {
 	limiter  *rate.Limiter
 	ctx      context.Context
 	closed   atomic.Bool
+
+	// access logging (per-connection)
+	destHost string
+	destPort int
+	startAt  time.Time
+	connUp   atomic.Int64
+	connDown atomic.Int64
 }
 
 func (c *trackedConn) Read(b []byte) (int, error) {
@@ -580,6 +681,7 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 		if c.us != nil {
 			c.us.upload.Add(int64(n)) // 从入站读取 = 用户上传
 		}
+		c.connUp.Add(int64(n))
 		if c.limiter != nil {
 			// Non-blocking rate limiting
 			if !c.limiter.AllowN(time.Now(), n) {
@@ -625,8 +727,11 @@ func (c *trackedConn) Write(b []byte) (int, error) {
 	}
 
 	n, err := c.Conn.Write(b)
-	if n > 0 && c.us != nil {
-		c.us.download.Add(int64(n)) // 向入站写入 = 用户下载
+	if n > 0 {
+		if c.us != nil {
+			c.us.download.Add(int64(n)) // 向入站写入 = 用户下载
+		}
+		c.connDown.Add(int64(n))
 	}
 	return n, err
 }
@@ -637,18 +742,20 @@ func (c *trackedConn) Close() error {
 			c.us.removeConn(c.sourceIP)
 		}
 		c.tracker.removeConnRef(c.connID)
+		c.tracker.emitAccess(c)
 	}
 	return c.Conn.Close()
 }
 
 // makeCountFunc builds a CountFunc for zero-copy byte counting via sing's
 // ReadCounter/WriteCounter unwrap interfaces.
-func (c *trackedConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
+func (c *trackedConn) makeCountFunc(counter, connCounter *atomic.Int64) N.CountFunc {
 	if c.limiter == nil {
-		return func(n int64) { counter.Add(n) }
+		return func(n int64) { counter.Add(n); connCounter.Add(n) }
 	}
 	return func(n int64) {
 		counter.Add(n)
+		connCounter.Add(n)
 		// Non-blocking rate limiting with context cancellation
 		if !c.limiter.AllowN(time.Now(), int(n)) {
 			resv := c.limiter.ReserveN(time.Now(), int(n))
@@ -670,14 +777,14 @@ func (c *trackedConn) UnwrapReader() (io.Reader, []N.CountFunc) {
 	if c.us == nil {
 		return c.Conn, nil
 	}
-	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.upload)} // 从入站读取 = 用户上传
+	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.upload, &c.connUp)} // 从入站读取 = 用户上传
 }
 
 func (c *trackedConn) UnwrapWriter() (io.Writer, []N.CountFunc) {
 	if c.us == nil {
 		return c.Conn, nil
 	}
-	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.download)} // 向入站写入 = 用户下载
+	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.download, &c.connDown)} // 向入站写入 = 用户下载
 }
 
 func (c *trackedConn) Upstream() any           { return c.Conn }
@@ -696,6 +803,13 @@ type trackedPacketConn struct {
 	limiter  *rate.Limiter
 	ctx      context.Context
 	closed   atomic.Bool
+
+	// access logging (per-connection)
+	destHost string
+	destPort int
+	startAt  time.Time
+	connUp   atomic.Int64
+	connDown atomic.Int64
 }
 
 func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, error) {
@@ -705,6 +819,7 @@ func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, err
 		if c.us != nil {
 			c.us.upload.Add(n) // 从入站读取 = 用户上传
 		}
+		c.connUp.Add(n)
 		if c.limiter != nil {
 			// Non-blocking rate limiting with context cancellation
 			if !c.limiter.AllowN(time.Now(), int(n)) {
@@ -748,8 +863,11 @@ func (c *trackedPacketConn) WritePacket(buffer *buf.Buffer, dest singM.Socksaddr
 	}
 
 	err := c.PacketConn.WritePacket(buffer, dest)
-	if err == nil && c.us != nil {
-		c.us.download.Add(n) // 向入站写入 = 用户下载
+	if err == nil {
+		if c.us != nil {
+			c.us.download.Add(n) // 向入站写入 = 用户下载
+		}
+		c.connDown.Add(n)
 	}
 	return err
 }
@@ -760,16 +878,18 @@ func (c *trackedPacketConn) Close() error {
 			c.us.removeConn(c.sourceIP)
 		}
 		c.tracker.removeConnRef(c.connID)
+		c.tracker.emitAccessPacket(c)
 	}
 	return c.PacketConn.Close()
 }
 
-func (c *trackedPacketConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
+func (c *trackedPacketConn) makeCountFunc(counter, connCounter *atomic.Int64) N.CountFunc {
 	if c.limiter == nil {
-		return func(n int64) { counter.Add(n) }
+		return func(n int64) { counter.Add(n); connCounter.Add(n) }
 	}
 	return func(n int64) {
 		counter.Add(n)
+		connCounter.Add(n)
 		// Non-blocking rate limiting with context cancellation
 		if !c.limiter.AllowN(time.Now(), int(n)) {
 			resv := c.limiter.ReserveN(time.Now(), int(n))
@@ -791,14 +911,14 @@ func (c *trackedPacketConn) UnwrapPacketReader() (N.PacketReader, []N.CountFunc)
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download)}
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download, &c.connDown)}
 }
 
 func (c *trackedPacketConn) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc) {
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload)}
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload, &c.connUp)}
 }
 
 func (c *trackedPacketConn) Upstream() any           { return c.PacketConn }

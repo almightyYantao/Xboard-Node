@@ -95,6 +95,8 @@ func (f *fakeKernel) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) { f.s
 func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) { f.deviceLimitFunc = fn }
 func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string) { _ = users }
 func (f *fakeKernel) ClearGlobalDevices() {}
+func (f *fakeKernel) SetAccessLogEnabled(bool)            {}
+func (f *fakeKernel) DrainAccessLog() []model.AccessRecord { return nil }
 
 func newTestService(k *fakeKernel) *Service {
 	sharedLimiter := limiter.New()

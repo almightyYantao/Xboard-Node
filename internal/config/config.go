@@ -102,10 +102,11 @@ type PanelConfig struct {
 }
 
 type NodeConfig struct {
-	PushInterval         int `yaml:"push_interval"`
-	PullInterval         int `yaml:"pull_interval"`
-	TrackInterval        int `yaml:"track_interval"`         // sec, default 10
-	DeviceReportInterval int `yaml:"device_report_interval"` // sec, default 30
+	PushInterval         int  `yaml:"push_interval"`
+	PullInterval         int  `yaml:"pull_interval"`
+	TrackInterval        int  `yaml:"track_interval"`         // sec, default 10
+	DeviceReportInterval int  `yaml:"device_report_interval"` // sec, default 30
+	AccessLog            bool `yaml:"access_log"`             // 采集并上报连接级访问日志（域名/目标），默认关
 }
 
 // WSConfig holds WebSocket client tuning options.

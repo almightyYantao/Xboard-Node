@@ -304,6 +304,23 @@ func (c *Client) PushAlive(data map[int][]string) error {
 	return c.postJSON("/api/v1/server/UniProxy/alive", payload)
 }
 
+// accessLogPath returns the API path for access-log ingestion (v2 in machine mode).
+func (c *Client) accessLogPath() string {
+	if c.machineID > 0 {
+		return "/api/v2/server/accesslog"
+	}
+	return "/api/v1/server/UniProxy/accesslog"
+}
+
+// PushAccessLog submits a batch of per-connection access records to the panel,
+// which forwards them to the configured external log backend (not stored in DB).
+func (c *Client) PushAccessLog(records []map[string]any) error {
+	if len(records) == 0 {
+		return nil
+	}
+	return c.postJSON(c.accessLogPath(), map[string]interface{}{"logs": records})
+}
+
 // PushStatus submits system status to the panel
 func (c *Client) PushStatus(cpu float64, mem, swap, disk [2]uint64) error {
 	payload := map[string]interface{}{

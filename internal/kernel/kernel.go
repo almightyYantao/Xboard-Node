@@ -101,6 +101,12 @@ type Kernel interface {
 	UpdateGlobalDevices(users map[int][]string)
 	// ClearGlobalDevices clears the global device state (on WS disconnect).
 	ClearGlobalDevices()
+
+	// SetAccessLogEnabled toggles per-connection access logging (domain/dest capture).
+	// Default off; zero overhead when disabled. Kernels without support may no-op.
+	SetAccessLogEnabled(enabled bool)
+	// DrainAccessLog returns and clears the buffered access records since last drain.
+	DrainAccessLog() []model.AccessRecord
 }
 
 // ComputeHash returns a hash of config + user identities that would

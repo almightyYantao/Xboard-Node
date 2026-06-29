@@ -24,3 +24,8 @@
 #       token: "machine-token-2"
 #     log:
 #       level: "debug"   # override for this instance only
+
+# ── Access logging (per-connection domain/dest capture) ──
+# 采集每条连接的目标域名/IP 并上报面板（面板再转发到外部日志后端，不入库）。默认关。
+# node:
+#   access_log: true

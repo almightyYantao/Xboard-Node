@@ -72,6 +72,8 @@ jobs:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
     needs: test
+    # 仅上游仓库构建并推送镜像；fork 无 ghcr.io/cedar2025 写权限，跳过避免 CI 变红
+    if: github.repository == 'cedar2025/xboard-node'
     permissions:
       contents: read
       packages: write

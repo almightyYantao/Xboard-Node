@@ -27,7 +27,8 @@ DEFAULT_ACTION="install"
 DEFAULT_RELEASE_VERSION="latest"
 DEFAULT_LOG_LEVEL="info"
 DEFAULT_KERNEL_LOG_LEVEL="warn"
-DEFAULT_DOWNLOAD_BASE="https://github.com/cedar2025/xboard-node/releases"
+# 默认从本 fork 的 Releases 下载；可用环境变量 XBOARD_DOWNLOAD_BASE 覆盖
+DEFAULT_DOWNLOAD_BASE="${XBOARD_DOWNLOAD_BASE:-https://github.com/almightyYantao/Xboard-Node/releases}"
 
 ACTION="${DEFAULT_ACTION}"
 MODE=""

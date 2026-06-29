@@ -30,8 +30,15 @@ const (
 	serviceName            = "xboard-node.service"
 	serviceFilePath        = "/etc/systemd/system/xboard-node.service"
 	defaultInstallRoot     = "/etc/xboard-node"
-	downloadBase           = "https://github.com/cedar2025/xboard-node/releases"
 )
+
+// 默认从本 fork 的 Releases 下载；可用环境变量 XBOARD_DOWNLOAD_BASE 覆盖
+var downloadBase = func() string {
+	if v := os.Getenv("XBOARD_DOWNLOAD_BASE"); v != "" {
+		return v
+	}
+	return "https://github.com/almightyYantao/Xboard-Node/releases"
+}()
 
 var (
 	version   = "dev"

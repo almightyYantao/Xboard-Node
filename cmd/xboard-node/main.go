@@ -35,6 +35,9 @@ func main() {
 		os.Exit(0)
 	}
 
+	// 让 service 层能把版本号上报给面板（版本检测/一键更新用）
+	service.SetVersion(version)
+
 	rootCfg, err := config.LoadRoot(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)

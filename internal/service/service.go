@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -62,6 +63,8 @@ type Service struct {
 	// pushActive prevents overlapping push/pull goroutines.
 	pushActive atomic.Bool
 	pullActive atomic.Bool
+	// updating guards against launching multiple self-update processes.
+	updating atomic.Bool
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
@@ -1019,20 +1022,35 @@ func (s *Service) pushReportSync() {
 	}
 }
 
-// accessLogPusher is the optional capability a control plane exposes to forward
-// per-connection access records. Only the panel control plane implements it.
-type accessLogPusher interface {
-	PushAccessLog(records []map[string]any) (*bool, error)
+// agentVersion 是当前运行的二进制版本，由 main 通过 SetVersion 注入，用于上报面板做版本检测。
+var agentVersion = "dev"
+
+// SetVersion 在启动时由 main 设置一次。
+func SetVersion(v string) {
+	if v != "" {
+		agentVersion = v
+	}
 }
 
-// pushAccessLogAsync drains buffered access records from the kernel and forwards
-// them to the panel in a background goroutine. Best-effort: dropped on failure.
+// accessLogPusher is the optional capability a control plane exposes to forward
+// per-connection access records, report agent state, and receive control
+// directives (enabled toggle + desired upgrade target). Only the panel
+// control plane implements it.
+type accessLogPusher interface {
+	PushAccessLog(records []map[string]any, agent map[string]any) (enabled *bool, updateTo string, err error)
+}
+
+// pushAccessLogAsync drains buffered access records and ships them to the panel
+// together with agent state (version + load). It applies the panel-desired
+// per-node toggle and triggers a self-update when the panel requests a different
+// version. Runs every report cycle even when idle, so the panel can remotely
+// enable/disable and upgrade the node.
 func (s *Service) pushAccessLogAsync() {
 	pusher, ok := s.sink.(accessLogPusher)
 	if !ok {
 		return
 	}
-	records := s.kernel.DrainAccessLog() // 可能为空：此时仅作为开关轮询
+	records := s.kernel.DrainAccessLog() // 可能为空：此时仅作为开关/版本轮询
 	logs := make([]map[string]any, 0, len(records))
 	for _, r := range records {
 		logs = append(logs, map[string]any{
@@ -1047,8 +1065,13 @@ func (s *Service) pushAccessLogAsync() {
 			"duration_ms":    r.DurationMs,
 		})
 	}
+	agent := map[string]any{
+		"version":            agentVersion,
+		"active_connections": s.tracker.ActiveConnections(),
+		"online_users":       len(s.tracker.CurrentOnline()),
+	}
 	go func() {
-		enabled, err := pusher.PushAccessLog(logs)
+		enabled, updateTo, err := pusher.PushAccessLog(logs, agent)
 		if err != nil {
 			nlog.Core().Warn("failed to push access log", "error", err, "records", len(logs))
 			return
@@ -1057,7 +1080,30 @@ func (s *Service) pushAccessLogAsync() {
 		if enabled != nil {
 			s.kernel.SetAccessLogEnabled(*enabled)
 		}
+		// 面板请求升级到不同版本时，触发一次自更新
+		if updateTo != "" && updateTo != agentVersion {
+			s.triggerSelfUpdate(updateTo)
+		}
 	}()
+}
+
+// triggerSelfUpdate launches `xbctl upgrade` detached from this service's systemd
+// cgroup (via systemd-run --scope), so the upgrade's `systemctl restart` doesn't
+// kill the upgrade process itself. Guarded so only one runs at a time.
+func (s *Service) triggerSelfUpdate(targetVersion string) {
+	if !s.updating.CompareAndSwap(false, true) {
+		return
+	}
+	nlog.Core().Warn("self-update requested by panel", "from", agentVersion, "to", targetVersion)
+	cmd := exec.Command("systemd-run", "--scope", "--collect",
+		"xbctl", "upgrade", "--version", targetVersion)
+	if err := cmd.Start(); err != nil {
+		nlog.Core().Error("self-update launch failed", "error", err)
+		s.updating.Store(false)
+		return
+	}
+	// 不 Wait：升级进程在独立 scope 里跑，会重启本服务（本进程随之退出）
+	_ = cmd.Process.Release()
 }
 
 // buildMetrics aggregates node-level metrics to be reported to the panel.

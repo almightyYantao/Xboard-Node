@@ -112,8 +112,8 @@ func (p *PanelControlPlane) Report(payload ReportPayload) error {
 // PushAccessLog forwards a batch of access records to the panel and returns the
 // panel-desired enabled state for this node (nil = unspecified). Discovered via
 // an optional interface assertion in the service layer (not part of Sink).
-func (p *PanelControlPlane) PushAccessLog(records []map[string]any) (*bool, error) {
-	return p.client.PushAccessLog(records)
+func (p *PanelControlPlane) PushAccessLog(records []map[string]any, agent map[string]any) (*bool, string, error) {
+	return p.client.PushAccessLog(records, agent)
 }
 
 func (p *PanelControlPlane) ReportDevices(push PushClient, devices map[int][]string) {

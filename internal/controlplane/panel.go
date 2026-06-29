@@ -109,9 +109,10 @@ func (p *PanelControlPlane) Report(payload ReportPayload) error {
 	return p.client.Report(payload.Traffic, payload.Alive, payload.Online, payload.CPU, payload.Mem, payload.Swap, payload.Disk, payload.Metrics)
 }
 
-// PushAccessLog forwards a batch of access records to the panel. Discovered via
+// PushAccessLog forwards a batch of access records to the panel and returns the
+// panel-desired enabled state for this node (nil = unspecified). Discovered via
 // an optional interface assertion in the service layer (not part of Sink).
-func (p *PanelControlPlane) PushAccessLog(records []map[string]any) error {
+func (p *PanelControlPlane) PushAccessLog(records []map[string]any) (*bool, error) {
 	return p.client.PushAccessLog(records)
 }
 

@@ -312,13 +312,41 @@ func (c *Client) accessLogPath() string {
 	return "/api/v1/server/UniProxy/accesslog"
 }
 
-// PushAccessLog submits a batch of per-connection access records to the panel,
-// which forwards them to the configured external log backend (not stored in DB).
-func (c *Client) PushAccessLog(records []map[string]any) error {
-	if len(records) == 0 {
-		return nil
+// PushAccessLog submits a batch of per-connection access records to the panel
+// (forwarded to the external log backend, not stored in DB) and reads back the
+// panel-desired enabled state for this node. records may be empty — the call
+// doubles as a poll for the per-node toggle. Returns nil *bool if the panel
+// didn't include an enabled flag (older panel), so the caller keeps current state.
+func (c *Client) PushAccessLog(records []map[string]any) (*bool, error) {
+	if records == nil {
+		records = []map[string]any{}
 	}
-	return c.postJSON(c.accessLogPath(), map[string]interface{}{"logs": records})
+	payload := map[string]interface{}{"logs": records}
+	c.injectAuth(payload)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+	resp, err := c.doRequest("POST", c.accessLogPath(), body, "")
+	if err != nil {
+		return nil, fmt.Errorf("post accesslog: %w", err)
+	}
+	defer drainAndClose(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, b)
+	}
+	c.apiSuccess.Add(1)
+
+	var ack struct {
+		Data struct {
+			Enabled *bool `json:"enabled"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ack); err != nil {
+		return nil, nil // 推送成功但解析不了开关，保持当前状态
+	}
+	return ack.Data.Enabled, nil
 }
 
 // PushStatus submits system status to the panel

@@ -1022,23 +1022,17 @@ func (s *Service) pushReportSync() {
 // accessLogPusher is the optional capability a control plane exposes to forward
 // per-connection access records. Only the panel control plane implements it.
 type accessLogPusher interface {
-	PushAccessLog(records []map[string]any) error
+	PushAccessLog(records []map[string]any) (*bool, error)
 }
 
 // pushAccessLogAsync drains buffered access records from the kernel and forwards
 // them to the panel in a background goroutine. Best-effort: dropped on failure.
 func (s *Service) pushAccessLogAsync() {
-	if !s.cfg.Node.AccessLog {
-		return
-	}
 	pusher, ok := s.sink.(accessLogPusher)
 	if !ok {
 		return
 	}
-	records := s.kernel.DrainAccessLog()
-	if len(records) == 0 {
-		return
-	}
+	records := s.kernel.DrainAccessLog() // 可能为空：此时仅作为开关轮询
 	logs := make([]map[string]any, 0, len(records))
 	for _, r := range records {
 		logs = append(logs, map[string]any{
@@ -1054,8 +1048,14 @@ func (s *Service) pushAccessLogAsync() {
 		})
 	}
 	go func() {
-		if err := pusher.PushAccessLog(logs); err != nil {
+		enabled, err := pusher.PushAccessLog(logs)
+		if err != nil {
 			nlog.Core().Warn("failed to push access log", "error", err, "records", len(logs))
+			return
+		}
+		// 面板是开关权威来源：每轮按面板返回值同步本地状态
+		if enabled != nil {
+			s.kernel.SetAccessLogEnabled(*enabled)
 		}
 	}()
 }

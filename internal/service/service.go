@@ -1061,6 +1061,7 @@ func (s *Service) pushAccessLogAsync() {
 			"upload_bytes":   r.Upload,
 			"download_bytes": r.Download,
 			"duration_ms":    r.DurationMs,
+			"reason":         r.Reason,
 		})
 	}
 	agent := map[string]any{

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -195,6 +196,7 @@ func (t *ConnTracker) emitAccess(c *trackedConn) {
 		Upload:     c.connUp.Load(),
 		Download:   c.connDown.Load(),
 		DurationMs: time.Since(c.startAt).Milliseconds(),
+		Reason:     derefStr(c.failReason.Load()),
 	})
 }
 
@@ -213,7 +215,30 @@ func (t *ConnTracker) emitAccessPacket(c *trackedPacketConn) {
 		Upload:     c.connUp.Load(),
 		Download:   c.connDown.Load(),
 		DurationMs: time.Since(c.startAt).Milliseconds(),
+		Reason:     derefStr(c.failReason.Load()),
 	})
+}
+
+// cleanReason 去掉 sing 包裹的 "open connection to X using outbound/Y]: " 前缀，
+// 只保留核心错误，并截断长度。
+func cleanReason(s string) string {
+	if i := strings.Index(s, "]: "); i >= 0 {
+		s = s[i+3:]
+	}
+	s = strings.TrimSpace(s)
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	return s
+}
+
+func ptrStr(s string) *string { return &s }
+
+func derefStr(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // destFromMeta extracts the requested target (domain preferred, else IP) and port.
@@ -664,11 +689,12 @@ type trackedConn struct {
 	closed   atomic.Bool
 
 	// access logging (per-connection)
-	destHost string
-	destPort int
-	startAt  time.Time
-	connUp   atomic.Int64
-	connDown atomic.Int64
+	destHost   string
+	destPort   int
+	startAt    time.Time
+	connUp     atomic.Int64
+	connDown   atomic.Int64
+	failReason atomic.Pointer[string] // 出站拨号失败原因（sing 经 HandshakeFailure 回调写入）
 }
 
 func (c *trackedConn) Read(b []byte) (int, error) {
@@ -792,6 +818,16 @@ func (c *trackedConn) Upstream() any           { return c.Conn }
 func (c *trackedConn) ReaderReplaceable() bool { return true }
 func (c *trackedConn) WriterReplaceable() bool { return true }
 
+// HandshakeFailure 由 sing 的 N.CloseOnHandshakeFailure 在出站拨号失败时回调，
+// 携带真实错误（connection refused / i/o timeout / 域名解析失败 等）。
+// 记录原因后转发给内层连接，保留各入站协议自身的失败响应行为。
+func (c *trackedConn) HandshakeFailure(err error) error {
+	if err != nil {
+		c.failReason.Store(ptrStr(cleanReason(err.Error())))
+	}
+	return N.ReportHandshakeFailure(c.Conn, err)
+}
+
 // ─── trackedPacketConn (UDP / QUIC) ─────────────────────────────────────────
 
 type trackedPacketConn struct {
@@ -806,11 +842,12 @@ type trackedPacketConn struct {
 	closed   atomic.Bool
 
 	// access logging (per-connection)
-	destHost string
-	destPort int
-	startAt  time.Time
-	connUp   atomic.Int64
-	connDown atomic.Int64
+	destHost   string
+	destPort   int
+	startAt    time.Time
+	connUp     atomic.Int64
+	connDown   atomic.Int64
+	failReason atomic.Pointer[string]
 }
 
 func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, error) {
@@ -925,3 +962,10 @@ func (c *trackedPacketConn) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc)
 func (c *trackedPacketConn) Upstream() any           { return c.PacketConn }
 func (c *trackedPacketConn) ReaderReplaceable() bool { return true }
 func (c *trackedPacketConn) WriterReplaceable() bool { return true }
+
+func (c *trackedPacketConn) HandshakeFailure(err error) error {
+	if err != nil {
+		c.failReason.Store(ptrStr(cleanReason(err.Error())))
+	}
+	return N.ReportHandshakeFailure(c.PacketConn, err)
+}

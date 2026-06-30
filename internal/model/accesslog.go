@@ -13,4 +13,5 @@ type AccessRecord struct {
 	Upload     int64  `json:"upload_bytes"`   // 该连接上行字节
 	Download   int64  `json:"download_bytes"` // 该连接下行字节
 	DurationMs int64  `json:"duration_ms"`    // 连接时长（毫秒）
+	Reason     string `json:"reason,omitempty"` // 出站拨号失败原因（成功为空）
 }

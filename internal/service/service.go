@@ -37,6 +37,7 @@ type Service struct {
 	tracker      *tracker.Tracker
 	limiter      *limiter.Limiter
 	speedTracker *limiter.SpeedTracker
+	autoThrottle *limiter.AutoThrottle
 	cert         *cert.Manager
 
 	lastConfig *model.NodeSpec
@@ -162,6 +163,7 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		tracker:      tracker.New(),
 		limiter:      l,
 		speedTracker: st,
+		autoThrottle: limiter.NewAutoThrottle(),
 		cert:         certMgr,
 		wsEvents:     make(chan controlplane.Event, 16),
 		wsStatusCh:   make(chan controlplane.StatusChange, 4),
@@ -590,6 +592,20 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 			s.kernel.UpdateGlobalDevices(event.DeviceUsers)
 		}
 
+	case controlplane.EventKickUser:
+		// Panel-triggered force-close of a user's active connections.
+		if len(event.KickUUIDs) == 0 {
+			return
+		}
+		if s.nodeLog != nil {
+			s.nodeLog.Info(fmt.Sprintf("kick user: %d users", len(event.KickUUIDs)))
+		}
+		for _, uuid := range event.KickUUIDs {
+			if err := s.kernel.CloseUserConnections(ctx, uuid); err != nil {
+				nlog.Core().Warn("kick user failed", "user", uuid, "error", err)
+			}
+		}
+
 	default:
 		nlog.Core().Debug(fmt.Sprintf("unknown ws event: %v", event.Type))
 	}
@@ -952,6 +968,9 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 
 	s.tracker.Process(traffic, aliveIPs, connCount)
 
+	// Auto-mitigation: throttle / kick users driving sustained heavy traffic.
+	s.applyAutoThrottle(ctx)
+
 	// Only log stats if there's actual traffic or connections
 	if connCount > 0 || len(traffic) > 0 {
 		if s.nodeLog != nil {
@@ -960,6 +979,86 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 			nlog.TrackerStats(connCount, len(traffic))
 		}
 	}
+}
+
+// applyAutoThrottle evaluates each user's current throughput against the
+// panel-pushed auto-mitigation policy and throttles / kicks / releases as the
+// engine decides. It always runs the engine (even when the policy is disabled)
+// so lingering penalties get released; it early-returns only when the policy is
+// off AND no user is currently tracked.
+func (s *Service) applyAutoThrottle(ctx context.Context) {
+	s.metricsMu.RLock()
+	var at *model.AutoThrottleConfig
+	if s.lastConfig != nil {
+		at = s.lastConfig.AutoThrottle
+	}
+	s.metricsMu.RUnlock()
+
+	if at == nil && !s.autoThrottle.Active() {
+		return
+	}
+
+	interval := int64(s.cfg.Node.TrackInterval)
+	if interval <= 0 {
+		interval = 1
+	}
+
+	var p limiter.AutoThrottleParams
+	if at != nil {
+		p = limiter.AutoThrottleParams{
+			ThresholdBps:    int64(at.ThresholdMbps) * 1_000_000 / 8,
+			TriggerCycles:   at.TriggerCycles,
+			PenaltyBps:      at.PenaltyMbps * 1_000_000 / 8,
+			KickAfterCycles: at.KickAfterCycles,
+			Release:         time.Duration(at.ReleaseSeconds) * time.Second,
+		}
+	}
+
+	// Per-user throughput this cycle, in bytes/sec.
+	delta := s.tracker.PerUserSpeed()
+	speeds := make(map[int]int64, len(delta))
+	for uid, d := range delta {
+		speeds[uid] = (d[0] + d[1]) / interval
+	}
+
+	dec := s.autoThrottle.Evaluate(time.Now(), p, speeds)
+
+	for uid, bps := range dec.Throttle {
+		s.speedTracker.SetPenalty(uid, bps)
+	}
+	for _, uid := range dec.Clear {
+		s.speedTracker.ClearPenalty(uid)
+	}
+	if len(dec.Throttle) > 0 || len(dec.Clear) > 0 {
+		nlog.Core().Info("auto-throttle applied",
+			"throttled", len(dec.Throttle), "released", len(dec.Clear))
+	}
+	if len(dec.Kick) > 0 {
+		uuidByID := s.userUUIDByID()
+		for _, uid := range dec.Kick {
+			uuid := uuidByID[uid]
+			if uuid == "" {
+				continue
+			}
+			if err := s.kernel.CloseUserConnections(ctx, uuid); err != nil {
+				nlog.Core().Warn("auto-throttle kick failed", "user_id", uid, "error", err)
+			} else {
+				nlog.Core().Warn("auto-throttle kicked hot user", "user_id", uid)
+			}
+		}
+	}
+}
+
+// userUUIDByID returns a userID→UUID map from the last applied user set.
+func (s *Service) userUUIDByID() map[int]string {
+	s.metricsMu.RLock()
+	users := s.lastUsers
+	s.metricsMu.RUnlock()
+	m := make(map[int]string, len(users))
+	for _, u := range users {
+		m[u.ID] = u.UUID
+	}
+	return m
 }
 
 // pushReportAsync sends the report in a background goroutine so the select
@@ -1035,7 +1134,7 @@ func SetVersion(v string) {
 // directives (enabled toggle + desired upgrade target). Only the panel
 // control plane implements it.
 type accessLogPusher interface {
-	PushAccessLog(records []map[string]any, agent map[string]any) (enabled *bool, updateTo string, err error)
+	PushAccessLog(records []map[string]any, agent map[string]any) (enabled *bool, updateTo string, kick []string, err error)
 }
 
 // pushAccessLogAsync drains buffered access records and ships them to the panel
@@ -1070,7 +1169,7 @@ func (s *Service) pushAccessLogAsync() {
 		"online_users":       len(s.tracker.CurrentOnline()),
 	}
 	go func() {
-		enabled, updateTo, err := pusher.PushAccessLog(logs, agent)
+		enabled, updateTo, kick, err := pusher.PushAccessLog(logs, agent)
 		if err != nil {
 			nlog.Core().Warn("failed to push access log", "error", err, "records", len(logs))
 			return
@@ -1082,6 +1181,16 @@ func (s *Service) pushAccessLogAsync() {
 		// 面板请求升级到不同版本时，触发一次自更新
 		if updateTo != "" && updateTo != agentVersion {
 			s.triggerSelfUpdate(updateTo)
+		}
+		// 面板下发的强制下线指令（HTTP/REST 模式下的踢人通道，WS 用 kick.user 事件）。
+		// 面板每次轮询返回待踢 UUID；若持续返回同一 UUID 相当于持续封禁（新连接会被反复关闭）。
+		for _, uuid := range kick {
+			if uuid == "" {
+				continue
+			}
+			if err := s.kernel.CloseUserConnections(context.Background(), uuid); err != nil {
+				nlog.Core().Warn("kick user (accesslog channel) failed", "user", uuid, "error", err)
+			}
 		}
 	}()
 }
@@ -1135,6 +1244,18 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 	m["inbound_speed"] = s.tracker.InboundSpeed()
 	m["outbound_speed"] = s.tracker.OutboundSpeed()
 
+	// Per-user speed: surface the top talkers so the panel can spot who is
+	// currently driving traffic (for throttling / kicking). Bytes/second.
+	if top := s.topUserSpeed(topUserSpeedN); len(top) > 0 {
+		m["top_user_speed"] = top
+	}
+
+	// Per-user connection count: surfaces connection-flood abuse (many conns,
+	// low bytes) that the speed view alone would miss.
+	if conns := s.topUserConns(topUserSpeedN); len(conns) > 0 {
+		m["top_user_conns"] = conns
+	}
+
 	// Per-core CPU usage (if available).
 	if len(status.CPUPerCore) > 0 {
 		m["cpu_per_core"] = status.CPUPerCore
@@ -1148,8 +1269,9 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 
 	// Speed Limiter metrics
 	m["speed_limiter"] = map[string]interface{}{
-		"has_limits":    s.speedTracker.HasLimits(),
-		"limited_users": s.speedTracker.LimitedUserCount(),
+		"has_limits":      s.speedTracker.HasLimits(),
+		"limited_users":   s.speedTracker.LimitedUserCount(),
+		"penalized_users": s.speedTracker.PenalizedCount(),
 	}
 
 	// GC metrics.
@@ -1181,6 +1303,80 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 	}
 
 	return m
+}
+
+// topUserSpeedN caps how many top talkers are reported in metrics, bounding
+// payload size on nodes with many concurrent users.
+const topUserSpeedN = 20
+
+// topUserSpeed returns the top-N users by current traffic rate, as
+// [uid, upload_bps, download_bps] triples sorted by total rate descending.
+// Rate is derived from the last track cycle's delta divided by the track
+// interval. Returns nil when no user has traffic this cycle.
+func (s *Service) topUserSpeed(n int) [][3]int64 {
+	delta := s.tracker.PerUserSpeed()
+	if len(delta) == 0 {
+		return nil
+	}
+
+	interval := int64(s.cfg.Node.TrackInterval)
+	if interval <= 0 {
+		interval = 1
+	}
+
+	rates := make([][3]int64, 0, len(delta))
+	for uid, d := range delta {
+		up := d[0] / interval
+		down := d[1] / interval
+		if up == 0 && down == 0 {
+			continue
+		}
+		rates = append(rates, [3]int64{int64(uid), up, down})
+	}
+	if len(rates) == 0 {
+		return nil
+	}
+
+	sort.Slice(rates, func(i, j int) bool {
+		return rates[i][1]+rates[i][2] > rates[j][1]+rates[j][2]
+	})
+	if len(rates) > n {
+		rates = rates[:n]
+	}
+	return rates
+}
+
+// userConnCounter is the optional capability a kernel exposes to report
+// per-user active connection counts. Only sing-box implements it; kernels
+// without support are simply skipped.
+type userConnCounter interface {
+	GetUserConnCounts() map[int]int
+}
+
+// topUserConns returns the top-N users by active connection count, as
+// [uid, conns] pairs sorted descending. Returns nil when the kernel doesn't
+// support per-user connection counts or no user has connections.
+func (s *Service) topUserConns(n int) [][2]int64 {
+	counter, ok := s.kernel.(userConnCounter)
+	if !ok {
+		return nil
+	}
+	counts := counter.GetUserConnCounts()
+	if len(counts) == 0 {
+		return nil
+	}
+
+	pairs := make([][2]int64, 0, len(counts))
+	for uid, c := range counts {
+		pairs = append(pairs, [2]int64{int64(uid), int64(c)})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		return pairs[i][1] > pairs[j][1]
+	})
+	if len(pairs) > n {
+		pairs = pairs[:n]
+	}
+	return pairs
 }
 
 // computeConfigHash returns a deterministic hash of the node config.

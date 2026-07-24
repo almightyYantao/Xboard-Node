@@ -14,6 +14,7 @@ import (
 // It is swapped atomically so readers never block writers.
 type snapshot struct {
 	traffic   map[int][2]int64        // userID → [upload, download] delta
+	userSpeed map[int][2]int64        // userID → [upload, download] delta of the last cycle
 	aliveIPs  map[int]map[string]bool // userID → set of source IPs
 	online    map[int]int             // userID → distinct IP count
 	connCount int
@@ -65,9 +66,10 @@ func New() *Tracker {
 	}
 	// Publish initial empty snapshot.
 	t.live.Store(&snapshot{
-		traffic:  make(map[int][2]int64),
-		aliveIPs: make(map[int]map[string]bool),
-		online:   make(map[int]int),
+		traffic:   make(map[int][2]int64),
+		userSpeed: make(map[int][2]int64),
+		aliveIPs:  make(map[int]map[string]bool),
+		online:    make(map[int]int),
 	})
 	return t
 }
@@ -86,6 +88,9 @@ func (t *Tracker) Process(
 	defer t.mu.Unlock()
 
 	var cycleIn, cycleOut int64
+
+	// Per-user delta for this cycle — the basis for per-user speed.
+	userSpeed := make(map[int][2]int64, len(cumTraffic))
 
 	for uid, cum := range cumTraffic {
 		prev := t.lastSeen[uid]
@@ -108,6 +113,8 @@ func (t *Tracker) Process(
 			cur[1] += deltaDown
 			t.pendingTraffic[uid] = cur
 
+			userSpeed[uid] = [2]int64{deltaUp, deltaDown}
+
 			cycleOut += deltaUp
 			cycleIn += deltaDown
 		}
@@ -122,6 +129,7 @@ func (t *Tracker) Process(
 	// Publish new snapshot (readers will see this atomically).
 	t.live.Store(&snapshot{
 		traffic:   copyTrafficMap(t.pendingTraffic),
+		userSpeed: userSpeed,
 		aliveIPs:  kernelAliveIPs, // kernel provides fresh copy each tick
 		online:    online,
 		connCount: connCount,
@@ -297,6 +305,19 @@ func (t *Tracker) InboundSpeed() int64 {
 // Lock-free: reads from live snapshot.
 func (t *Tracker) OutboundSpeed() int64 {
 	return t.live.Load().outSpeed / 10
+}
+
+// PerUserSpeed returns each user's traffic delta from the most recent Process
+// cycle as [upload, download] bytes. Only users with non-zero delta are
+// included. Divide by the track interval (seconds) to obtain bytes/second.
+// Lock-free: reads from live snapshot.
+func (t *Tracker) PerUserSpeed() map[int][2]int64 {
+	s := t.live.Load()
+	cp := make(map[int][2]int64, len(s.userSpeed))
+	for uid, v := range s.userSpeed {
+		cp[uid] = v
+	}
+	return cp
 }
 
 // copyTrafficMap creates a shallow copy of the traffic map.

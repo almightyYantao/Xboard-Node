@@ -21,6 +21,7 @@ const (
 	WSEventSyncUserDelta = "sync.user.delta"
 	WSEventSyncDevices   = "sync.devices"   // panel → node: global device state
 	WSEventSyncNodes     = "sync.nodes"     // panel → machine: node list changed
+	WSEventKickUser      = "kick.user"      // panel → node: force-close a user's connections
 	WSEventReportDevices = "report.devices" // node → panel: report device snapshot
 )
 
@@ -38,6 +39,9 @@ type WSEvent struct {
 
 	// Machine node discovery fields (for sync.nodes)
 	Nodes []MachineNode
+
+	// Kick fields (for kick.user): UUIDs of users to force-close.
+	KickUUIDs []string
 }
 
 // WSStatusChange notifies the service when WS connectivity changes.
@@ -82,6 +86,13 @@ type syncDevicesPayload struct {
 // syncNodesPayload carries the updated node list for a machine.
 type syncNodesPayload struct {
 	Nodes []MachineNode `json:"nodes"`
+}
+
+// kickUserPayload carries the UUIDs whose connections should be force-closed.
+type kickUserPayload struct {
+	UUIDs     []string `json:"uuids"`
+	Timestamp int64    `json:"timestamp"`
+	NodeID    int      `json:"node_id"`
 }
 
 // WSClientConfig holds WebSocket client tuning options.
@@ -349,6 +360,9 @@ func (w *WSClient) handleMessage(msg wsMessage) {
 	case WSEventSyncNodes:
 		w.handleDataEvent(msg)
 
+	case WSEventKickUser:
+		w.handleDataEvent(msg)
+
 	default:
 		nlog.Core().Debug("ws unknown event", "event", msg.Event)
 	}
@@ -437,6 +451,20 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 			return
 		}
 		event.Nodes = p.Nodes
+
+	case WSEventKickUser:
+		nlog.Core().Info("ws kick user event received")
+		var p kickUserPayload
+		if err := decodeData(msg.Data, &p); err != nil {
+			nlog.Core().Warn("ws: cannot decode kick payload", "error", err)
+			return
+		}
+		if len(p.UUIDs) == 0 {
+			nlog.Core().Warn("ws: kick payload has no uuids")
+			return
+		}
+		event.KickUUIDs = p.UUIDs
+		event.NodeID = p.NodeID
 	}
 
 	w.onEvent(event)

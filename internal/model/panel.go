@@ -122,6 +122,33 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 		TrafficPattern:      nc.TrafficPattern,
 		Multiplex:           multiplex,
 		AcceptProxyProtocol: nc.AcceptProxyProtocol,
+		AutoThrottle:        autoThrottleFromPanel(nc.AutoThrottle),
+	}
+}
+
+func autoThrottleFromPanel(at *panel.AutoThrottleConfig) *AutoThrottleConfig {
+	if at == nil {
+		return nil
+	}
+	return &AutoThrottleConfig{
+		ThresholdMbps:   at.ThresholdMbps,
+		TriggerCycles:   at.TriggerCycles,
+		PenaltyMbps:     at.PenaltyMbps,
+		KickAfterCycles: at.KickAfterCycles,
+		ReleaseSeconds:  at.ReleaseSeconds,
+	}
+}
+
+func autoThrottleToPanel(at *AutoThrottleConfig) *panel.AutoThrottleConfig {
+	if at == nil {
+		return nil
+	}
+	return &panel.AutoThrottleConfig{
+		ThresholdMbps:   at.ThresholdMbps,
+		TriggerCycles:   at.TriggerCycles,
+		PenaltyMbps:     at.PenaltyMbps,
+		KickAfterCycles: at.KickAfterCycles,
+		ReleaseSeconds:  at.ReleaseSeconds,
 	}
 }
 
@@ -261,6 +288,7 @@ func (n *NodeSpec) ToPanel() *panel.NodeConfig {
 		TrafficPattern:      n.TrafficPattern,
 		Multiplex:           multiplex,
 		AcceptProxyProtocol: n.AcceptProxyProtocol,
+		AutoThrottle:        autoThrottleToPanel(n.AutoThrottle),
 	}
 }
 

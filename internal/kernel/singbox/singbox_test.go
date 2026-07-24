@@ -17,10 +17,10 @@ import (
 func TestSingBoxCapabilities(t *testing.T) {
 	s := New(config.KernelConfig{Type: "sing-box"})
 	caps := s.Capabilities()
-	if !caps.PerUserSpeedLimit || !caps.DeviceLimit || !caps.AliveIPTracking || !caps.ForceCloseUser {
+	if !caps.PerUserSpeedLimit || !caps.DeviceLimit || !caps.AliveIPTracking || !caps.ForceCloseUser || !caps.ForceCloseConnection {
 		t.Fatalf("unexpected sing-box capabilities: %+v", caps)
 	}
-	if caps.BuiltInTrafficStats || caps.ForceCloseConnection {
+	if caps.BuiltInTrafficStats {
 		t.Fatalf("unexpected sing-box capabilities: %+v", caps)
 	}
 	protocols := s.Protocols()
@@ -177,6 +177,31 @@ func TestConnTrackerCloseByIDClosesTrackedConnection(t *testing.T) {
 	}
 	if !base.closed {
 		t.Fatal("expected underlying connection to be closed")
+	}
+}
+
+func TestConnTrackerCloseByUUIDClosesAllUserConnections(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"uuid-1": 1, "uuid-2": 2})
+
+	base1a := &testConn{}
+	base1b := &testConn{}
+	base2 := &testConn{}
+	tracker.RoutedConnection(context.Background(), base1a, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
+	tracker.RoutedConnection(context.Background(), base1b, testInboundContext("uuid-1", "1.1.1.2"), nil, nil)
+	tracker.RoutedConnection(context.Background(), base2, testInboundContext("uuid-2", "2.2.2.2"), nil, nil)
+
+	if n := tracker.CloseByUUID("uuid-1"); n != 2 {
+		t.Fatalf("CloseByUUID(uuid-1) = %d, want 2", n)
+	}
+	if !base1a.closed || !base1b.closed {
+		t.Fatal("expected both uuid-1 connections to be closed")
+	}
+	if base2.closed {
+		t.Fatal("uuid-2 connection should not be closed")
+	}
+	if n := tracker.CloseByUUID("unknown"); n != 0 {
+		t.Fatalf("CloseByUUID(unknown) = %d, want 0", n)
 	}
 }
 

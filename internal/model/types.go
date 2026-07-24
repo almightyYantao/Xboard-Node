@@ -45,6 +45,22 @@ type NodeSpec struct {
 
 	Multiplex           *MultiplexConfig
 	AcceptProxyProtocol bool
+
+	// AutoThrottle is the panel-pushed auto-mitigation policy. Nil = disabled.
+	AutoThrottle *AutoThrottleConfig
+}
+
+// AutoThrottleConfig is the node-side auto-mitigation policy: when a user's
+// throughput stays above ThresholdMbps for TriggerCycles track cycles, the node
+// throttles them to PenaltyMbps; if they stay hot for KickAfterCycles more
+// cycles it force-closes their connections. The penalty lifts after the user
+// has been below the threshold for ReleaseSeconds. All zero = disabled.
+type AutoThrottleConfig struct {
+	ThresholdMbps   int
+	TriggerCycles   int
+	PenaltyMbps     int
+	KickAfterCycles int
+	ReleaseSeconds  int
 }
 
 type OutboundConfig struct {

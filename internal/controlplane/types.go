@@ -13,6 +13,7 @@ const (
 	EventSyncUsers     EventType = "sync.users"
 	EventSyncUserDelta EventType = "sync.user.delta"
 	EventSyncDevices   EventType = "sync.devices"
+	EventKickUser      EventType = "kick.user"
 )
 
 type Event struct {
@@ -22,6 +23,7 @@ type Event struct {
 	DeltaAction string
 	DeltaUsers  []model.UserSpec
 	DeviceUsers map[int][]string
+	KickUUIDs   []string
 }
 
 type StatusChange struct {

@@ -127,11 +127,20 @@ func (u *userStats) aliveIPList() map[string]bool {
 //   - Hooking into sing's ReadCounter/WriteCounter for zero-copy byte counting
 //   - Close callback to decrement IP refcounts
 //   - Per-connection rate limit token accumulation (amortized WaitN)
+// connRef holds a closable connection plus the user it belongs to, so the
+// tracker can force-close either a single connection (by ID) or every
+// connection of a user (by UUID). Both net.Conn and N.PacketConn satisfy
+// io.Closer, so this covers TCP and UDP.
+type connRef struct {
+	closer io.Closer
+	userID int
+}
+
 type ConnTracker struct {
 	usersMu sync.RWMutex
-	users   map[int]*userStats  // userID → stats
-	uuidMap map[string]int      // UUID → userID (for lookup in RoutedConnection)
-	connMap map[string]net.Conn // connID → conn (only for force-close support)
+	users   map[int]*userStats // userID → stats
+	uuidMap map[string]int     // UUID → userID (for lookup in RoutedConnection)
+	connMap map[string]connRef // connID → conn ref (for force-close support)
 
 	idCounter atomic.Int64
 
@@ -255,7 +264,7 @@ func NewConnTracker(_ int) *ConnTracker {
 	return &ConnTracker{
 		users:         make(map[int]*userStats),
 		uuidMap:       make(map[string]int),
-		connMap:       make(map[string]net.Conn),
+		connMap:       make(map[string]connRef),
 		globalDevices: make(map[int]map[string]bool),
 	}
 }
@@ -347,7 +356,7 @@ func (t *ConnTracker) RoutedConnection(
 
 	// Store conn reference for force-close support
 	t.usersMu.Lock()
-	t.connMap[connID] = conn
+	t.connMap[connID] = connRef{closer: conn, userID: uid}
 	t.usersMu.Unlock()
 
 	var lim *rate.Limiter
@@ -373,10 +382,9 @@ func (t *ConnTracker) RoutedConnection(
 	return tc
 }
 
-// RoutedPacketConnection wraps UDP with per-user counting (UDP not in connMap).
-// Note: UDP connections are NOT stored in connMap because connMap is typed as
-// map[string]net.Conn, but PacketConn is a different interface. Force-close
-// for UDP connections is handled directly via trackedPacketConn.Close().
+// RoutedPacketConnection wraps UDP with per-user counting and registers the
+// packet conn in connMap so it can be force-closed by ID or by user UUID
+// (N.PacketConn satisfies io.Closer). trackedPacketConn.Close removes the ref.
 func (t *ConnTracker) RoutedPacketConnection(
 	ctx context.Context, conn N.PacketConn,
 	metadata adapter.InboundContext,
@@ -407,6 +415,11 @@ func (t *ConnTracker) RoutedPacketConnection(
 	}
 
 	connID := t.nextID()
+
+	// Store conn reference for force-close support (TCP + UDP).
+	t.usersMu.Lock()
+	t.connMap[connID] = connRef{closer: conn, userID: uid}
+	t.usersMu.Unlock()
 
 	var lim *rate.Limiter
 	if slf := t.speedLimitFunc.Load(); slf != nil {
@@ -560,26 +573,68 @@ func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[i
 	return
 }
 
+// GetUserConnCounts returns per-user active connection counts (only users with
+// at least one connection). O(users). Useful for spotting connection-flood
+// abuse that a bytes/sec view alone would miss.
+func (t *ConnTracker) GetUserConnCounts() map[int]int {
+	t.usersMu.RLock()
+	defer t.usersMu.RUnlock()
+	out := make(map[int]int, len(t.users))
+	for uid, us := range t.users {
+		us.mu.Lock()
+		c := us.connCount
+		us.mu.Unlock()
+		if c > 0 {
+			out[uid] = c
+		}
+	}
+	return out
+}
+
 // CloseByID force-closes a connection by its ID.
 func (t *ConnTracker) CloseByID(id string) bool {
 	t.usersMu.RLock()
-	conn, ok := t.connMap[id]
+	ref, ok := t.connMap[id]
 	t.usersMu.RUnlock()
 	if !ok {
 		return false
 	}
-	if conn != nil {
-		conn.Close()
+	if ref.closer != nil {
+		ref.closer.Close()
 	}
 	return true
 }
 
-// CloseByUUID force-closes ALL connections for a given user UUID.
+// CloseByUUID force-closes ALL active connections (TCP + UDP) for a given
+// user UUID and returns the number of connections it closed. It closes the
+// underlying socket, which makes the next I/O fail; sing-box then tears down
+// the wrapper, whose Close() is what actually removes the connMap entry and
+// releases the IP/conn refcounts. Cleanup is therefore asynchronous — the
+// returned count reflects sockets closed now, not entries already removed, and
+// a repeated call in the teardown window may re-close (harmlessly) the same
+// sockets.
 func (t *ConnTracker) CloseByUUID(uuid string) int {
-	// This is a no-op for now — sing-box doesn't expose per-user connection
-	// kill easily. The kernel's RemoveUsers removes the inbound user which
-	// prevents new connections, and existing connections will fail on next I/O.
-	return 0
+	t.usersMu.RLock()
+	uid, ok := t.uuidMap[uuid]
+	if !ok {
+		t.usersMu.RUnlock()
+		return 0
+	}
+	// Snapshot the matching closers under the read lock, then Close() them
+	// after releasing it: Close can block on network teardown, and we must not
+	// hold usersMu (also taken by RoutedConnection and removeConnRef) meanwhile.
+	closers := make([]io.Closer, 0, 8)
+	for _, ref := range t.connMap {
+		if ref.userID == uid && ref.closer != nil {
+			closers = append(closers, ref.closer)
+		}
+	}
+	t.usersMu.RUnlock()
+
+	for _, c := range closers {
+		c.Close()
+	}
+	return len(closers)
 }
 
 // ActiveCount returns the total number of active connections.

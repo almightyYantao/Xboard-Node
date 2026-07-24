@@ -317,7 +317,7 @@ func (c *Client) accessLogPath() string {
 // panel-desired enabled state for this node. records may be empty — the call
 // doubles as a poll for the per-node toggle. Returns nil *bool if the panel
 // didn't include an enabled flag (older panel), so the caller keeps current state.
-func (c *Client) PushAccessLog(records []map[string]any, agent map[string]any) (enabled *bool, updateTo string, err error) {
+func (c *Client) PushAccessLog(records []map[string]any, agent map[string]any) (enabled *bool, updateTo string, kick []string, err error) {
 	if records == nil {
 		records = []map[string]any{}
 	}
@@ -328,16 +328,16 @@ func (c *Client) PushAccessLog(records []map[string]any, agent map[string]any) (
 	c.injectAuth(payload)
 	body, mErr := json.Marshal(payload)
 	if mErr != nil {
-		return nil, "", fmt.Errorf("marshal: %w", mErr)
+		return nil, "", nil, fmt.Errorf("marshal: %w", mErr)
 	}
 	resp, rErr := c.doRequest("POST", c.accessLogPath(), body, "")
 	if rErr != nil {
-		return nil, "", fmt.Errorf("post accesslog: %w", rErr)
+		return nil, "", nil, fmt.Errorf("post accesslog: %w", rErr)
 	}
 	defer drainAndClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, "", fmt.Errorf("status %d: %s", resp.StatusCode, b)
+		return nil, "", nil, fmt.Errorf("status %d: %s", resp.StatusCode, b)
 	}
 	c.apiSuccess.Add(1)
 
@@ -347,12 +347,13 @@ func (c *Client) PushAccessLog(records []map[string]any, agent map[string]any) (
 			Update  struct {
 				To string `json:"to"`
 			} `json:"update"`
+			Kick []string `json:"kick"` // UUIDs the panel wants force-closed
 		} `json:"data"`
 	}
 	if dErr := json.NewDecoder(resp.Body).Decode(&ack); dErr != nil {
-		return nil, "", nil // 推送成功但解析不了，保持当前状态
+		return nil, "", nil, nil // 推送成功但解析不了，保持当前状态
 	}
-	return ack.Data.Enabled, ack.Data.Update.To, nil
+	return ack.Data.Enabled, ack.Data.Update.To, ack.Data.Kick, nil
 }
 
 // PushStatus submits system status to the panel

@@ -134,9 +134,9 @@ func (p *MachinePanelControlPlane) Report(payload ReportPayload) error {
 }
 
 // PushAccessLog forwards access records + agent state and returns the panel's
-// desired enabled state / upgrade target. Same optional capability as the
-// non-machine panel control plane (machine mode runs one of these per node).
-func (p *MachinePanelControlPlane) PushAccessLog(records []map[string]any, agent map[string]any) (*bool, string, error) {
+// desired enabled state / upgrade target / kick list. Same optional capability
+// as the non-machine panel control plane (machine mode runs one of these per node).
+func (p *MachinePanelControlPlane) PushAccessLog(records []map[string]any, agent map[string]any) (*bool, string, []string, error) {
 	return p.client.PushAccessLog(records, agent)
 }
 

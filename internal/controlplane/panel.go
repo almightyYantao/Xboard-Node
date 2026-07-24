@@ -110,9 +110,10 @@ func (p *PanelControlPlane) Report(payload ReportPayload) error {
 }
 
 // PushAccessLog forwards a batch of access records to the panel and returns the
-// panel-desired enabled state for this node (nil = unspecified). Discovered via
+// panel-desired enabled state for this node (nil = unspecified), an optional
+// self-update target, and any UUIDs the panel wants force-closed. Discovered via
 // an optional interface assertion in the service layer (not part of Sink).
-func (p *PanelControlPlane) PushAccessLog(records []map[string]any, agent map[string]any) (*bool, string, error) {
+func (p *PanelControlPlane) PushAccessLog(records []map[string]any, agent map[string]any) (*bool, string, []string, error) {
 	return p.client.PushAccessLog(records, agent)
 }
 
@@ -167,7 +168,7 @@ func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{
 }
 
 func TranslateWSEvent(event panel.WSEvent, kcfg config.KernelConfig) (Event, error) {
-	translated := Event{Type: EventType(event.Type), DeltaAction: event.DeltaAction, DeviceUsers: event.DeviceUsers}
+	translated := Event{Type: EventType(event.Type), DeltaAction: event.DeltaAction, DeviceUsers: event.DeviceUsers, KickUUIDs: event.KickUUIDs}
 	if event.Config != nil {
 		var err error
 		translated.Config, err = model.NodeSpecFromPanelValidated(event.Config, kcfg)

@@ -97,7 +97,7 @@ func (s *SingBox) Capabilities() kernel.Capabilities {
 		DeviceLimit:          true,
 		BuiltInTrafficStats:  false,
 		AliveIPTracking:      true,
-		ForceCloseConnection: false,
+		ForceCloseConnection: true,
 		ForceCloseUser:       true,
 	}
 }
@@ -644,6 +644,16 @@ func (s *SingBox) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, a
 	return traffic, aliveIPs, connCount, nil
 }
 
+// GetUserConnCounts returns per-user active connection counts, or nil if the
+// kernel is not running. Satisfies the service layer's optional interface.
+func (s *SingBox) GetUserConnCounts() map[int]int {
+	ct := s.connTrackerSafe()
+	if ct == nil {
+		return nil
+	}
+	return ct.GetUserConnCounts()
+}
+
 // CloseConnection force-closes a specific connection by its ID.
 func (s *SingBox) CloseConnection(_ context.Context, connID string) error {
 	ct := s.connTrackerSafe()
@@ -662,7 +672,8 @@ func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
 	if ct == nil {
 		return nil
 	}
-	ct.CloseByUUID(uuid)
+	closed := ct.CloseByUUID(uuid)
+	nlog.Core().Info("singbox: force-closed user connections", "user", uuid, "closed", closed)
 	return nil
 }
 

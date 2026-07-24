@@ -21,6 +21,11 @@ type SpeedTracker struct {
 	buckets map[int]*rate.Limiter // userID → shared rate limiter
 	uuidMap map[string]int        // UUID → userID
 
+	// penalized holds userIDs whose bucket is currently held at an auto-throttle
+	// penalty rate. UpdateBuckets leaves these alone so a routine user-sync from
+	// the panel doesn't lift an active penalty; ClearPenalty restores them.
+	penalized map[int]struct{}
+
 	// Fast-path: when no users have a speed limit, GetLimiter returns nil
 	// immediately without any map lookup.
 	hasLimits atomic.Bool
@@ -32,9 +37,10 @@ type SpeedTracker struct {
 // NewSpeedTracker creates a bucket manager for per-user bandwidth throttling.
 func NewSpeedTracker(l *Limiter) *SpeedTracker {
 	return &SpeedTracker{
-		limiter: l,
-		buckets: make(map[int]*rate.Limiter),
-		uuidMap: make(map[string]int),
+		limiter:   l,
+		buckets:   make(map[int]*rate.Limiter),
+		uuidMap:   make(map[string]int),
+		penalized: make(map[int]struct{}),
 	}
 }
 
@@ -65,6 +71,12 @@ func (t *SpeedTracker) UpdateBuckets() {
 				newUUIDMap[user.UUID] = user.ID
 			}
 
+			// Leave penalized users' buckets alone — a routine user-sync must
+			// not lift an active auto-throttle penalty.
+			if _, pen := t.penalized[user.ID]; pen {
+				continue
+			}
+
 			// Update existing limiter if speed changed
 			if lim, ok := t.buckets[user.ID]; ok {
 				if user.SpeedLimit > 0 {
@@ -85,6 +97,7 @@ func (t *SpeedTracker) UpdateBuckets() {
 		for id := range t.buckets {
 			if _, ok := activeIDs[id]; !ok {
 				delete(t.buckets, id)
+				delete(t.penalized, id)
 			}
 		}
 
@@ -157,4 +170,72 @@ func (t *SpeedTracker) LimitedUserCount() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return len(t.buckets)
+}
+
+// penaltyBurst returns a sensible burst for a given bytes/sec rate.
+func penaltyBurst(bytesPerSec int) int {
+	burst := bytesPerSec
+	if burst < 64*1024 {
+		burst = 64 * 1024
+	}
+	return burst
+}
+
+// SetPenalty forces a user's shared bucket to the given bytes/sec rate and marks
+// them penalized so UpdateBuckets won't lift it. Idempotent: safe to call every
+// track cycle to keep the penalty in force. Existing connections of a user who
+// already had a bucket (i.e. a configured speed limit) are throttled
+// immediately because they share this instance; unlimited users only feel it on
+// their next connection (which is why the policy escalates to a kick).
+func (t *SpeedTracker) SetPenalty(userID, bytesPerSec int) {
+	if bytesPerSec <= 0 {
+		bytesPerSec = 1
+	}
+	burst := penaltyBurst(bytesPerSec)
+	t.mu.Lock()
+	if lim, ok := t.buckets[userID]; ok {
+		lim.SetLimit(rate.Limit(bytesPerSec))
+		lim.SetBurst(burst)
+	} else {
+		t.buckets[userID] = rate.NewLimiter(rate.Limit(bytesPerSec), burst)
+	}
+	t.penalized[userID] = struct{}{}
+	t.hasLimits.Store(true)
+	t.mu.Unlock()
+}
+
+// ClearPenalty lifts a user's auto-throttle penalty, restoring their configured
+// speed limit (or removing the bucket entirely if they have none).
+func (t *SpeedTracker) ClearPenalty(userID int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.penalized[userID]; !ok {
+		return
+	}
+	delete(t.penalized, userID)
+
+	t.limiter.mu.RLock()
+	u, exists := t.limiter.users[userID]
+	t.limiter.mu.RUnlock()
+
+	if exists && u.SpeedLimit > 0 {
+		bytesPerSec := u.SpeedLimit * 1_000_000 / 8
+		burst := penaltyBurst(bytesPerSec)
+		if lim, ok := t.buckets[userID]; ok {
+			lim.SetLimit(rate.Limit(bytesPerSec))
+			lim.SetBurst(burst)
+		} else {
+			t.buckets[userID] = rate.NewLimiter(rate.Limit(bytesPerSec), burst)
+		}
+	} else {
+		delete(t.buckets, userID)
+	}
+	t.hasLimits.Store(len(t.buckets) > 0)
+}
+
+// PenalizedCount returns the number of users currently under an auto-throttle penalty.
+func (t *SpeedTracker) PenalizedCount() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return len(t.penalized)
 }

@@ -143,6 +143,18 @@ type NodeConfig struct {
 
 	// Proxy Protocol (supports both top-level and networkSettings for compatibility)
 	AcceptProxyProtocol bool `json:"accept_proxy_protocol,omitempty"`
+
+	// AutoThrottle is the node-side auto-mitigation policy (Xboard extension).
+	AutoThrottle *AutoThrottleConfig `json:"auto_throttle,omitempty"`
+}
+
+// AutoThrottleConfig mirrors model.AutoThrottleConfig on the wire.
+type AutoThrottleConfig struct {
+	ThresholdMbps   int `json:"threshold_mbps"`
+	TriggerCycles   int `json:"trigger_cycles"`
+	PenaltyMbps     int `json:"penalty_mbps"`
+	KickAfterCycles int `json:"kick_after_cycles"`
+	ReleaseSeconds  int `json:"release_seconds"`
 }
 
 // GetProxyProtocol returns true if AcceptProxyProtocol is set either at node level

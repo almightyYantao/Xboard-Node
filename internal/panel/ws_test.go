@@ -14,16 +14,16 @@ import (
 )
 
 // fakeWSServer simulates a minimal Workerman-style WS server for testing.
-// It authenticates via token/node_id query params, sends auth.success, then
-// delivers the provided events and handles pongs until the client disconnects.
+// It authenticates via the Authorization header (token) + node_id query param,
+// sends auth.success, then delivers the provided events and handles pongs
+// until the client disconnects.
 func fakeWSServer(t *testing.T, events []wsMessage) *httptest.Server {
 	t.Helper()
 	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Validate query params
 		q := r.URL.Query()
-		if q.Get("token") == "" || q.Get("node_id") == "" {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || q.Get("node_id") == "" {
 			http.Error(w, "missing auth params", http.StatusUnauthorized)
 			return
 		}

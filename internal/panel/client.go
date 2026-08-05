@@ -409,8 +409,9 @@ func (c *Client) ReportMachineStatus(cpu float64, mem, swap, disk [2]uint64, net
 }
 
 // injectAuth writes authentication fields into a payload map.
+// The token itself travels only via the Authorization header (see doRequest),
+// never in the body or query string, so it can't leak into access/proxy logs.
 func (c *Client) injectAuth(m map[string]interface{}) {
-	m["token"] = c.token
 	if c.machineID > 0 {
 		m["machine_id"] = c.machineID
 		if c.nodeID > 0 {
@@ -425,9 +426,9 @@ func (c *Client) injectAuth(m map[string]interface{}) {
 }
 
 // authQuery builds URL query parameters for GET requests.
+// The token itself is never included here — see doRequest's Authorization header.
 func (c *Client) authQuery() url.Values {
 	q := url.Values{}
-	q.Set("token", c.token)
 	if c.machineID > 0 {
 		q.Set("machine_id", strconv.Itoa(c.machineID))
 		if c.nodeID > 0 {
@@ -487,6 +488,9 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	if ifNoneMatch != "" {
 		req.Header.Set("If-None-Match", ifNoneMatch)
 	}

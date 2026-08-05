@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"net/url"
 	"strconv"
 	"sync/atomic"
@@ -105,8 +106,9 @@ type WSClientConfig struct {
 }
 
 // WSClient connects to the panel's Workerman WS server using native WebSocket.
-// Authentication is done via query parameters (token + node_id) during the
-// WebSocket handshake — no separate auth step needed.
+// Authentication happens during the handshake: node_id/machine_id ride the
+// query string (not secret), the token rides the Authorization header —
+// no separate auth step needed.
 type WSClient struct {
 	wsURL    string // base WS URL, e.g. ws://panel.example.com:8076
 	token    string
@@ -126,7 +128,7 @@ type WSClient struct {
 
 // NewWSClient creates a new WebSocket client.
 // wsURL is the base WebSocket URL (e.g. "ws://panel.example.com:8076").
-// token and nodeID are used for authentication via query parameters.
+// token authenticates via the handshake Authorization header; nodeID rides the query string.
 func NewWSClient(wsURL string, token string, nodeID int, cfg WSClientConfig, onEvent func(WSEvent), onStatus func(WSStatusChange), onPing func() map[string]interface{}) *WSClient {
 	// Apply defaults
 	if cfg.StatusInterval == 0 {
@@ -213,7 +215,6 @@ func (w *WSClient) connect(ctx context.Context) error {
 		return fmt.Errorf("parse ws url: %w", err)
 	}
 	q := u.Query()
-	q.Set("token", w.token)
 	if w.cfg.MachineID > 0 {
 		q.Set("machine_id", strconv.Itoa(w.cfg.MachineID))
 	} else {
@@ -226,7 +227,13 @@ func (w *WSClient) connect(ctx context.Context) error {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: w.cfg.HandshakeTimeout,
 	}
-	conn, _, err := dialer.DialContext(ctx, u.String(), nil)
+	// Token travels via the handshake Authorization header, never the URL,
+	// so it can't leak into access/proxy logs.
+	header := http.Header{}
+	if w.token != "" {
+		header.Set("Authorization", "Bearer "+w.token)
+	}
+	conn, _, err := dialer.DialContext(ctx, u.String(), header)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}

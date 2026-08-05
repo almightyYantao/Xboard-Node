@@ -24,8 +24,11 @@ func TestGetConfig_Success(t *testing.T) {
 		if r.URL.Path != "/api/v1/server/UniProxy/config" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
-		if r.URL.Query().Get("token") != "test-token" {
-			t.Errorf("missing token in query")
+		if r.URL.Query().Get("token") != "" {
+			t.Errorf("token must not appear in query string")
+		}
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Errorf("missing/incorrect Authorization header: %q", r.Header.Get("Authorization"))
 		}
 		if r.URL.Query().Get("node_id") != "1" {
 			t.Errorf("missing node_id in query")
@@ -161,6 +164,9 @@ func TestPushTraffic_Success(t *testing.T) {
 		if r.URL.Path != "/api/v1/server/UniProxy/push" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Errorf("missing/incorrect Authorization header: %q", r.Header.Get("Authorization"))
+		}
 		json.NewDecoder(r.Body).Decode(&received)
 		w.WriteHeader(http.StatusOK)
 	})
@@ -176,9 +182,9 @@ func TestPushTraffic_Success(t *testing.T) {
 	if received == nil {
 		t.Fatal("server received nil payload")
 	}
-	// Verify token was injected
-	if received["token"] != "test-token" {
-		t.Errorf("token: got %v", received["token"])
+	// Token must not appear in the body anymore — it travels via the Authorization header.
+	if _, ok := received["token"]; ok {
+		t.Errorf("token must not be present in body: %v", received["token"])
 	}
 }
 

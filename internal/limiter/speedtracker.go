@@ -239,3 +239,15 @@ func (t *SpeedTracker) PenalizedCount() int {
 	defer t.mu.RUnlock()
 	return len(t.penalized)
 }
+
+// PenalizedUserIDs returns the IDs of users currently under an auto-throttle
+// penalty, so the panel can show who (not just how many).
+func (t *SpeedTracker) PenalizedUserIDs() []int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	ids := make([]int, 0, len(t.penalized))
+	for id := range t.penalized {
+		ids = append(ids, id)
+	}
+	return ids
+}

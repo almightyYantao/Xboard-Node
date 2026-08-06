@@ -1030,8 +1030,21 @@ func (s *Service) applyAutoThrottle(ctx context.Context) {
 		s.speedTracker.ClearPenalty(uid)
 	}
 	if len(dec.Throttle) > 0 || len(dec.Clear) > 0 {
-		nlog.Core().Info("auto-throttle applied",
-			"throttled", len(dec.Throttle), "released", len(dec.Clear))
+		uuidByID := s.userUUIDByID()
+		if len(dec.Throttle) > 0 {
+			names := make([]string, 0, len(dec.Throttle))
+			for uid := range dec.Throttle {
+				names = append(names, uuidOrFallback(uuidByID, uid))
+			}
+			nlog.Core().Info("auto-throttle applied", "users", strings.Join(names, ","))
+		}
+		if len(dec.Clear) > 0 {
+			names := make([]string, 0, len(dec.Clear))
+			for _, uid := range dec.Clear {
+				names = append(names, uuidOrFallback(uuidByID, uid))
+			}
+			nlog.Core().Info("auto-throttle released", "users", strings.Join(names, ","))
+		}
 	}
 	if len(dec.Kick) > 0 {
 		uuidByID := s.userUUIDByID()
@@ -1041,12 +1054,21 @@ func (s *Service) applyAutoThrottle(ctx context.Context) {
 				continue
 			}
 			if err := s.kernel.CloseUserConnections(ctx, uuid); err != nil {
-				nlog.Core().Warn("auto-throttle kick failed", "user_id", uid, "error", err)
+				nlog.Core().Warn("auto-throttle kick failed", "user", uuid, "error", err)
 			} else {
-				nlog.Core().Warn("auto-throttle kicked hot user", "user_id", uid)
+				nlog.Core().Warn("auto-throttle kicked hot user", "user", uuid)
 			}
 		}
 	}
+}
+
+// uuidOrFallback returns uuidByID[uid], falling back to a bare "user#<id>" tag
+// when the ID isn't in the last applied user set (e.g. removed mid-penalty).
+func uuidOrFallback(uuidByID map[int]string, uid int) string {
+	if uuid, ok := uuidByID[uid]; ok && uuid != "" {
+		return uuid
+	}
+	return fmt.Sprintf("user#%d", uid)
 }
 
 // userUUIDByID returns a userID→UUID map from the last applied user set.
@@ -1272,6 +1294,7 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 		"has_limits":      s.speedTracker.HasLimits(),
 		"limited_users":   s.speedTracker.LimitedUserCount(),
 		"penalized_users": s.speedTracker.PenalizedCount(),
+		"penalized_uids":  s.speedTracker.PenalizedUserIDs(), // who, not just how many
 	}
 
 	// GC metrics.

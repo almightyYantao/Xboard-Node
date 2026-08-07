@@ -51,6 +51,9 @@ YES=0
 ARCH=""
 OS=""
 DOWNLOAD_URL=""
+# 下载代理（仅用于拉取 GitHub 二进制；国内机常需要）。
+# 可用环境变量 XBOARD_PROXY 或 --proxy 指定，例如 socks5://10.10.52.215:12126
+PROXY="${XBOARD_PROXY:-}"
 CURRENT_STATE="fresh"
 TMP_DIR=""
 BACKUP_PATH=""
@@ -188,6 +191,12 @@ usage() {
     --node-type, -T     Explicit node type for node mode
     --kernel, -k        singbox or xray (default: singbox)
     --version           Release version or latest (default: latest)
+    --proxy             Proxy for downloading binaries (e.g. socks5://host:port,
+                        http://host:port). 国内机拉不到 GitHub 时使用。
+                        也可用环境变量 XBOARD_PROXY。健康检查不走此代理。
+    --download-base     Release 下载源前缀，用于国内 GitHub 加速镜像。
+                        例: https://gh-proxy.com/https://github.com/almightyYantao/Xboard-Node/releases
+                        也可用环境变量 XBOARD_DOWNLOAD_BASE。
     --binary            Use a local xboard-node binary path instead of downloading
     --xbctl-binary      Use a local xbctl binary path instead of downloading
     --health-port       Local health port (default: 65530, use 0 to disable)
@@ -244,6 +253,14 @@ parse_args() {
                 ;;
             --version)
                 RELEASE_VERSION="$2"
+                shift 2
+                ;;
+            --proxy)
+                PROXY="$2"
+                shift 2
+                ;;
+            --download-base)
+                DEFAULT_DOWNLOAD_BASE="$2"
                 shift 2
                 ;;
             --binary)
@@ -490,6 +507,16 @@ resolve_download_url() {
     fi
 }
 
+# download_file <url> <dest>：下载文件，如设置了 PROXY 则通过代理拉取。
+download_file() {
+    local url="$1" dest="$2"
+    if [ -n "$PROXY" ]; then
+        curl -fsSL --proxy "$PROXY" "$url" -o "$dest"
+    else
+        curl -fsSL "$url" -o "$dest"
+    fi
+}
+
 stage_binary() {
     local staged="$TMP_DIR/xboard-node"
     local local_src
@@ -499,8 +526,8 @@ stage_binary() {
         cp "$local_src" "$staged"
     else
         resolve_download_url "xboard-node-linux-${ARCH}"
-        log_step "Downloading binary: ${DOWNLOAD_URL}"
-        if ! curl -fsSL "$DOWNLOAD_URL" -o "$staged"; then
+        log_step "Downloading binary: ${DOWNLOAD_URL}${PROXY:+ (proxy: ${PROXY})}"
+        if ! download_file "$DOWNLOAD_URL" "$staged"; then
             log_error "Failed to download binary from ${DOWNLOAD_URL}"
             exit 1
         fi
@@ -531,8 +558,8 @@ stage_xbctl() {
         cp "$local_src" "$staged"
     else
         resolve_download_url "xbctl-linux-${ARCH}"
-        log_step "Downloading xbctl: ${DOWNLOAD_URL}"
-        if ! curl -fsSL "$DOWNLOAD_URL" -o "$staged"; then
+        log_step "Downloading xbctl: ${DOWNLOAD_URL}${PROXY:+ (proxy: ${PROXY})}"
+        if ! download_file "$DOWNLOAD_URL" "$staged"; then
             log_error "Failed to download xbctl from ${DOWNLOAD_URL}"
             exit 1
         fi
@@ -675,7 +702,7 @@ wait_for_health() {
         if ! systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
             return 1
         fi
-        if curl -fsS "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
+        if curl -fsS --noproxy '*' "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
             return 0
         fi
         sleep 1

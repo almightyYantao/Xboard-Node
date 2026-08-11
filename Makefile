@@ -34,7 +34,11 @@ clean:
 docker:
 	docker build -t xboard-node:$(VERSION) -t xboard-node:latest .
 
-# Install to system (single node, legacy compat)
+# 本机快速安装（单节点，历史遗留用法）。
+#
+# **给新面板（lb-panel）装 agent 请走 install.sh** —— 它才会用 lb-node 那套名字
+# （/etc/lb-node、lb-node.service、lbctl、健康端口 65531），和现网跑着的
+# xboard-node 不打架。这个 target 仍然按旧名装，会覆盖现网 agent 的文件。
 install: build
 	sudo cp xboard-node /usr/local/bin/
 	sudo cp xbctl /usr/local/bin/

@@ -8,19 +8,33 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-APP_NAME="xboard-node"
-INSTALL_ROOT="/etc/xboard-node"
+# ---------------------------------------------------------------- 命名
+#
+# **和现网的 xboard-node 并存**：新面板（lb-panel）接的 agent 全套改名成 lb-node，
+# 二进制、服务名、配置目录、CLI、健康端口都和旧的不重叠，所以一台机器上可以
+# 老的照跑、新的照装，互不影响。迁移期结束再手动 `systemctl disable --now
+# xboard-node` 收尾 —— 这个脚本**永远不碰** xboard-node.service。
+#
+# 唯一保持旧名的是 Release 里的产物名（RELEASE_BIN / RELEASE_CLI）：CI 还在按
+# 那个名字发包，装到机器上时才改名。等 CI 也改了再动这两行。
+APP_NAME="lb-node"
+LEGACY_SERVICE_NAME="xboard-node.service"
+RELEASE_BIN="xboard-node"
+RELEASE_CLI="xbctl"
+INSTALL_ROOT="/etc/lb-node"
 BACKUP_DIR="${INSTALL_ROOT}/backups"
 INSTALL_META="${INSTALL_ROOT}/install-meta.json"
 CONFIG_FILE="${INSTALL_ROOT}/config.yml"
 CREDENTIALS_FILE="${INSTALL_ROOT}/credentials.env"
-BINARY_PATH="/usr/local/bin/xboard-node"
-SERVICE_NAME="xboard-node.service"
+BINARY_PATH="/usr/local/bin/lb-node"
+SERVICE_NAME="lb-node.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
-CLI_PATH="/usr/local/bin/xbctl"
+CLI_NAME="lbctl"
+CLI_PATH="/usr/local/bin/${CLI_NAME}"
 INSTALLER_COPY_PATH="${INSTALL_ROOT}/install.sh"
 CLI_BINARY_SOURCE=""
-DEFAULT_HEALTH_PORT=65530
+# 旧 agent 用 65530。共存期两个进程都在同一台机器上，端口必须错开
+DEFAULT_HEALTH_PORT=65531
 DEFAULT_KERNEL="singbox"
 DEFAULT_MODE="node"
 DEFAULT_ACTION="install"
@@ -99,8 +113,8 @@ load_health_port_from_config() {
 rollback_install() {
     log_warn "Rolling back installation"
     if [ -n "$BACKUP_PATH" ] && [ -d "$BACKUP_PATH" ]; then
-        if [ -f "$BACKUP_PATH/xboard-node" ]; then
-            install -m 755 "$BACKUP_PATH/xboard-node" "$BINARY_PATH"
+        if [ -f "$BACKUP_PATH/${APP_NAME}" ]; then
+            install -m 755 "$BACKUP_PATH/${APP_NAME}" "$BINARY_PATH"
         else
             rm -f "$BINARY_PATH"
         fi
@@ -119,8 +133,8 @@ rollback_install() {
         else
             rm -f "$INSTALL_META"
         fi
-        if [ -f "$BACKUP_PATH/xbctl" ]; then
-            install -m 755 "$BACKUP_PATH/xbctl" "$CLI_PATH"
+        if [ -f "$BACKUP_PATH/${CLI_NAME}" ]; then
+            install -m 755 "$BACKUP_PATH/${CLI_NAME}" "$CLI_PATH"
         else
             rm -f "$CLI_PATH"
         fi
@@ -164,7 +178,7 @@ trap cleanup_tmp EXIT
 usage() {
     cat <<'HELP'
 
-  xboard-node Installer
+  lb-node Installer
 
   ACTIONS:
     install      Install or reconcile the configured deployment (default)
@@ -197,13 +211,14 @@ usage() {
     --download-base     Release 下载源前缀，用于国内 GitHub 加速镜像。
                         例: https://gh-proxy.com/https://github.com/almightyYantao/Xboard-Node/releases
                         也可用环境变量 XBOARD_DOWNLOAD_BASE。
-    --binary            Use a local xboard-node binary path instead of downloading
-    --xbctl-binary      Use a local xbctl binary path instead of downloading
-    --health-port       Local health port (default: 65530, use 0 to disable)
+    --binary            Use a local lb-node binary path instead of downloading
+    --xbctl-binary      Use a local lbctl binary path instead of downloading
+    --health-port       Local health port (default: 65531, use 0 to disable)
+                        旧 xboard-node 用 65530，共存期别改回去
     --gomemlimit        Runtime GOMEMLIMIT value, e.g. 256MiB
     --gogc              Runtime GOGC value, e.g. 50
     --force-reconfigure Overwrite an existing install even if mode/target changed
-    --purge             With uninstall, delete /etc/xboard-node too
+    --purge             With uninstall, delete /etc/lb-node too
     --yes, -y           Non-interactive confirmation for destructive operations
 
   EXAMPLES:
@@ -487,12 +502,16 @@ select_binary_source() {
         echo "$BINARY_SOURCE"
         return
     fi
-    if [ -f "./xboard-node" ]; then
-        echo "./xboard-node"
+    if [ -f "./${APP_NAME}" ]; then
+        echo "./${APP_NAME}"
+        return 0
+    fi
+    if [ -f "./${RELEASE_BIN}" ]; then
+        echo "./${RELEASE_BIN}"
         return
     fi
-    if [ -f "./xboard-node-linux-${ARCH}" ]; then
-        echo "./xboard-node-linux-${ARCH}"
+    if [ -f "./${RELEASE_BIN}-linux-${ARCH}" ]; then
+        echo "./${RELEASE_BIN}-linux-${ARCH}"
         return
     fi
     echo ""
@@ -518,14 +537,14 @@ download_file() {
 }
 
 stage_binary() {
-    local staged="$TMP_DIR/xboard-node"
+    local staged="$TMP_DIR/${RELEASE_BIN}"
     local local_src
     local_src=$(select_binary_source)
     if [ -n "$local_src" ]; then
         log_step "Using local binary: ${local_src}"
         cp "$local_src" "$staged"
     else
-        resolve_download_url "xboard-node-linux-${ARCH}"
+        resolve_download_url "${RELEASE_BIN}-linux-${ARCH}"
         log_step "Downloading binary: ${DOWNLOAD_URL}${PROXY:+ (proxy: ${PROXY})}"
         if ! download_file "$DOWNLOAD_URL" "$staged"; then
             log_error "Failed to download binary from ${DOWNLOAD_URL}"
@@ -540,33 +559,35 @@ stage_binary() {
 }
 
 stage_xbctl() {
-    local staged="$TMP_DIR/xbctl"
+    local staged="$TMP_DIR/${RELEASE_CLI}"
     local local_src=""
     if [ -n "$CLI_BINARY_SOURCE" ]; then
         if [ ! -f "$CLI_BINARY_SOURCE" ]; then
-            log_error "xbctl binary source not found: $CLI_BINARY_SOURCE"
+            log_error "${CLI_NAME} binary source not found: $CLI_BINARY_SOURCE"
             exit 1
         fi
         local_src="$CLI_BINARY_SOURCE"
-    elif [ -f "./xbctl" ]; then
-        local_src="./xbctl"
-    elif [ -f "./xbctl-linux-${ARCH}" ]; then
-        local_src="./xbctl-linux-${ARCH}"
+    elif [ -f "./${CLI_NAME}" ]; then
+        local_src="./${CLI_NAME}"
+    elif [ -f "./${RELEASE_CLI}" ]; then
+        local_src="./${RELEASE_CLI}"
+    elif [ -f "./${RELEASE_CLI}-linux-${ARCH}" ]; then
+        local_src="./${RELEASE_CLI}-linux-${ARCH}"
     fi
     if [ -n "$local_src" ]; then
-        log_step "Using local xbctl binary: ${local_src}"
+        log_step "Using local ${CLI_NAME} binary: ${local_src}"
         cp "$local_src" "$staged"
     else
-        resolve_download_url "xbctl-linux-${ARCH}"
-        log_step "Downloading xbctl: ${DOWNLOAD_URL}${PROXY:+ (proxy: ${PROXY})}"
+        resolve_download_url "${RELEASE_CLI}-linux-${ARCH}"
+        log_step "Downloading ${CLI_NAME}: ${DOWNLOAD_URL}${PROXY:+ (proxy: ${PROXY})}"
         if ! download_file "$DOWNLOAD_URL" "$staged"; then
-            log_error "Failed to download xbctl from ${DOWNLOAD_URL}"
+            log_error "Failed to download ${CLI_NAME} from ${DOWNLOAD_URL}"
             exit 1
         fi
     fi
     chmod +x "$staged"
     if ! "$staged" version > /dev/null 2>&1; then
-        log_error "Downloaded xbctl failed version check"
+        log_error "Downloaded ${CLI_NAME} failed version check"
         exit 1
     fi
 }
@@ -607,8 +628,8 @@ render_config() {
     fi
 
     local output
-    output=$("$TMP_DIR/xbctl" "${init_args[@]}") || {
-        log_error "xbctl config init failed"
+    output=$("$TMP_DIR/${RELEASE_CLI}" "${init_args[@]}") || {
+        log_error "${CLI_NAME} config init failed"
         exit 1
     }
 
@@ -619,8 +640,8 @@ render_config() {
 render_service() {
     cat >"$TMP_DIR/${SERVICE_NAME}" <<EOF_UNIT
 [Unit]
-Description=Xboard Node Backend
-Documentation=https://github.com/cedar2025/xboard-node
+Description=LB Connect Node Agent
+Documentation=https://github.com/almightyYantao/lb-connect-admin/tree/main/node
 After=network-online.target
 Wants=network-online.target
 
@@ -645,10 +666,10 @@ backup_existing_state() {
     BACKUP_PATH="${BACKUP_DIR}/$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$BACKUP_PATH"
     if [ -x "$BINARY_PATH" ]; then
-        cp "$BINARY_PATH" "$BACKUP_PATH/xboard-node"
+        cp "$BINARY_PATH" "$BACKUP_PATH/${APP_NAME}"
     fi
     if [ -x "$CLI_PATH" ]; then
-        cp "$CLI_PATH" "$BACKUP_PATH/xbctl"
+        cp "$CLI_PATH" "$BACKUP_PATH/${CLI_NAME}"
     fi
     if [ -f "$CONFIG_FILE" ]; then
         cp "$CONFIG_FILE" "$BACKUP_PATH/config.yml"
@@ -675,15 +696,15 @@ stop_existing_service() {
 
 install_staged_files() {
     stop_existing_service
-    install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
+    install -m 755 "$TMP_DIR/${RELEASE_BIN}" "$BINARY_PATH"
     install -m 600 "$TMP_DIR/config.yml" "$CONFIG_FILE"
     install -m 600 "$TMP_DIR/credentials.env" "$CREDENTIALS_FILE"
     install -m 644 "$TMP_DIR/install-meta.json" "$INSTALL_META"
     if [ -f "$0" ] && [ "$(realpath "$0")" != "$(realpath "$INSTALLER_COPY_PATH" 2>/dev/null || echo "$INSTALLER_COPY_PATH")" ]; then
         install -m 755 "$0" "$INSTALLER_COPY_PATH"
     fi
-    install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
-    ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
+    install -m 755 "$TMP_DIR/${RELEASE_CLI}" "$CLI_PATH"
+    ln -sf "$CLI_PATH" "/usr/bin/${CLI_NAME}" 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
@@ -751,7 +772,7 @@ perform_install() {
     if [ "$HEALTH_ENABLED" -eq 1 ]; then
         log_info "Health: http://127.0.0.1:${HEALTH_PORT}/healthz"
     fi
-    log_info "CLI: ${CLI_PATH}  (run '${CLI_PATH} list' if xbctl is not in PATH)"
+    log_info "CLI: ${CLI_PATH}  (run '${CLI_PATH} list' if ${CLI_NAME} is not in PATH)"
 }
 
 perform_upgrade() {
@@ -767,9 +788,9 @@ perform_upgrade() {
     stage_xbctl
     render_service
     backup_existing_state
-    install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
-    install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
-    ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
+    install -m 755 "$TMP_DIR/${RELEASE_BIN}" "$BINARY_PATH"
+    install -m 755 "$TMP_DIR/${RELEASE_CLI}" "$CLI_PATH"
+    ln -sf "$CLI_PATH" "/usr/bin/${CLI_NAME}" 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
     systemctl restart "$SERVICE_NAME"
@@ -803,7 +824,7 @@ perform_uninstall() {
     fi
     rm -f "$BINARY_PATH"
     rm -f "$CLI_PATH"
-    rm -f /usr/bin/xbctl 2>/dev/null || true
+    rm -f "/usr/bin/${CLI_NAME}" 2>/dev/null || true
     if [ "$PURGE" -eq 1 ]; then
         rm -rf "$INSTALL_ROOT"
         log_info "Removed ${INSTALL_ROOT}"
@@ -817,7 +838,7 @@ perform_uninstall() {
 perform_status() {
     detect_current_state
     echo
-    echo -e "${BOLD}xboard-node install status${NC}"
+    echo -e "${BOLD}lb-node install status${NC}"
     echo "  state:   ${CURRENT_STATE}"
     if [ -f "$INSTALL_META" ]; then
         echo "  meta:    ${INSTALL_META}"
@@ -836,6 +857,14 @@ perform_status() {
     if [ -f "$SERVICE_PATH" ]; then
         echo "  service: ${SERVICE_NAME}"
         systemctl status "$SERVICE_NAME" --no-pager || true
+    fi
+    # 共存期一台机器上会有两个 agent。把旧的也列出来，免得看着新的 active
+    # 就以为老的已经停了 —— 本脚本不会去动它
+    if systemctl list-unit-files "$LEGACY_SERVICE_NAME" >/dev/null 2>&1 &&
+        [ -f "/etc/systemd/system/${LEGACY_SERVICE_NAME}" ]; then
+        echo "  legacy:  ${LEGACY_SERVICE_NAME} 仍在这台机器上（本脚本不管它）"
+        systemctl is-active "$LEGACY_SERVICE_NAME" >/dev/null 2>&1 &&
+            echo "           状态: active —— 迁移完成后再手动 systemctl disable --now ${LEGACY_SERVICE_NAME}"
     fi
 }
 

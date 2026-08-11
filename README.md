@@ -1,5 +1,20 @@
 # xboard-node
 
+> **给 lb-panel 用时装出来的是 `lb-node`。** `install.sh` 里的安装名已经和现网
+> 老 agent 分开，为的是同一台机器上能并存、老的不用停：
+>
+> | | 老 agent | 本仓库 install.sh |
+> |---|---|---|
+> | 二进制 | `/usr/local/bin/xboard-node` | `/usr/local/bin/lb-node` |
+> | 服务 | `xboard-node.service` | `lb-node.service` |
+> | 配置 / 证书 | `/etc/xboard-node/` | `/etc/lb-node/` |
+> | CLI | `xbctl` | `lbctl` |
+> | 健康端口 | 65530 | 65531 |
+>
+> Release 产物名（`xboard-node-linux-amd64` / `xbctl-linux-amd64`）没改，装到
+> 机器上时才改名 —— CI 和已发布的包都不用动。`make install` 仍按老名字装，
+> **别用它装新 agent**。两套并存时记得节点的 `server_port` 也不要撞。
+
 Node backend for [Xboard](https://github.com/cedar2025/Xboard). Supports `sing-box` / `xray-core` dual kernels.
 
 > **Disclaimer**: This project is for educational and learning purposes only.

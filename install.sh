@@ -135,8 +135,10 @@ rollback_install() {
         fi
         if [ -f "$BACKUP_PATH/${CLI_NAME}" ]; then
             install -m 755 "$BACKUP_PATH/${CLI_NAME}" "$CLI_PATH"
+            [ -f "$BACKUP_PATH/${CLI_NAME}.bin" ] &&
+                install -m 755 "$BACKUP_PATH/${CLI_NAME}.bin" "${CLI_PATH}.bin"
         else
-            rm -f "$CLI_PATH"
+            rm -f "$CLI_PATH" "${CLI_PATH}.bin"
         fi
         if [ -f "$BACKUP_PATH/${SERVICE_NAME}" ]; then
             install -m 644 "$BACKUP_PATH/${SERVICE_NAME}" "$SERVICE_PATH"
@@ -558,6 +560,27 @@ stage_binary() {
     fi
 }
 
+# CLI 装成一层 wrapper：真二进制在 ${CLI_PATH}.bin，wrapper 负责注入这套 agent
+# 的安装位置。
+#
+# 为什么要 wrapper：CLI 里那几个路径（config / meta / service / binary）默认值是
+# 编译期写死的老位置，两套 agent 并存时，第二套的 CLI 会去操作第一套 ——
+# `list` 显示错实例还只是误导，`service restart` / `upgrade` / `uninstall`
+# 打到另一套上是真会出事的。环境变量覆盖比给每个子命令加 flag 省事得多。
+install_cli() {
+    install -m 755 "$TMP_DIR/${RELEASE_CLI}" "${CLI_PATH}.bin"
+    cat >"$TMP_DIR/cli-wrapper" <<EOF_CLI
+#!/bin/sh
+# 由 install.sh 生成。指向 ${INSTALL_ROOT} 这一套 agent
+LB_NODE_INSTALL_ROOT="${INSTALL_ROOT}" \
+LB_NODE_SERVICE="${SERVICE_NAME}" \
+LB_NODE_BINARY="${BINARY_PATH}" \
+LB_NODE_CLI="${CLI_PATH}" \
+exec "${CLI_PATH}.bin" "\$@"
+EOF_CLI
+    install -m 755 "$TMP_DIR/cli-wrapper" "$CLI_PATH"
+}
+
 stage_xbctl() {
     local staged="$TMP_DIR/${RELEASE_CLI}"
     local local_src=""
@@ -649,6 +672,12 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=${INSTALL_ROOT}
 EnvironmentFile=-${CREDENTIALS_FILE}
+# 这套 agent 的安装位置。**自升级要靠 LB_NODE_CLI 找对 CLI** ——
+# 不注入的话新 agent 的自升级会去升同机的老 agent（面板下发触发，没人在场）
+Environment=LB_NODE_INSTALL_ROOT=${INSTALL_ROOT}
+Environment=LB_NODE_SERVICE=${SERVICE_NAME}
+Environment=LB_NODE_BINARY=${BINARY_PATH}
+Environment=LB_NODE_CLI=${CLI_PATH}
 ExecStart=${BINARY_PATH} -c ${CONFIG_FILE}
 Restart=always
 RestartSec=5
@@ -670,6 +699,7 @@ backup_existing_state() {
     fi
     if [ -x "$CLI_PATH" ]; then
         cp "$CLI_PATH" "$BACKUP_PATH/${CLI_NAME}"
+        [ -f "${CLI_PATH}.bin" ] && cp "${CLI_PATH}.bin" "$BACKUP_PATH/${CLI_NAME}.bin"
     fi
     if [ -f "$CONFIG_FILE" ]; then
         cp "$CONFIG_FILE" "$BACKUP_PATH/config.yml"
@@ -703,7 +733,7 @@ install_staged_files() {
     if [ -f "$0" ] && [ "$(realpath "$0")" != "$(realpath "$INSTALLER_COPY_PATH" 2>/dev/null || echo "$INSTALLER_COPY_PATH")" ]; then
         install -m 755 "$0" "$INSTALLER_COPY_PATH"
     fi
-    install -m 755 "$TMP_DIR/${RELEASE_CLI}" "$CLI_PATH"
+    install_cli
     ln -sf "$CLI_PATH" "/usr/bin/${CLI_NAME}" 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
@@ -789,7 +819,7 @@ perform_upgrade() {
     render_service
     backup_existing_state
     install -m 755 "$TMP_DIR/${RELEASE_BIN}" "$BINARY_PATH"
-    install -m 755 "$TMP_DIR/${RELEASE_CLI}" "$CLI_PATH"
+    install_cli
     ln -sf "$CLI_PATH" "/usr/bin/${CLI_NAME}" 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
@@ -823,7 +853,8 @@ perform_uninstall() {
         systemctl daemon-reload || true
     fi
     rm -f "$BINARY_PATH"
-    rm -f "$CLI_PATH"
+    # wrapper 和它背后的真二进制一起删
+    rm -f "$CLI_PATH" "${CLI_PATH}.bin"
     rm -f "/usr/bin/${CLI_NAME}" 2>/dev/null || true
     if [ "$PURGE" -eq 1 ]; then
         rm -rf "$INSTALL_ROOT"

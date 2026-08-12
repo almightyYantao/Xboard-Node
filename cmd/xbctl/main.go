@@ -21,16 +21,37 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const (
-	defaultConfigPath      = "/etc/xboard-node/config.yml"
-	defaultMetaPath        = "/etc/xboard-node/install-meta.json"
-	defaultCredentialsPath = "/etc/xboard-node/credentials.env"
-	defaultBinaryPath      = "/usr/local/bin/xboard-node"
-	defaultCLIPath         = "/usr/local/bin/xbctl"
-	serviceName            = "xboard-node.service"
-	serviceFilePath        = "/etc/systemd/system/xboard-node.service"
-	defaultInstallRoot     = "/etc/xboard-node"
+// 安装位置。**默认值就是历史值**，不带任何环境变量时行为和以前完全一致 ——
+// 现网跑着的 xbctl 不受影响。
+//
+// 之所以要能覆盖：一台机器上可能并存两套 agent（迁移期新旧共存），此时第二套
+// 装在 /etc/lb-node、服务叫 lb-node.service。CLI 的这些路径要是写死，第二套的
+// CLI 就会去操作第一套 —— `list` 显示错的实例还只是误导，`service restart`
+// `upgrade` `uninstall` 打到另一套上是真会出事的。
+//
+// 覆盖方式是环境变量而不是命令行参数：list / status / service / upgrade /
+// uninstall 这些子命令都不带 --install-root，改成全部加一个全局 flag 要动
+// 每一个命令的参数解析；环境变量由安装脚本写进 wrapper，用的人不用关心。
+var (
+	installRootDefault     = envOr("LB_NODE_INSTALL_ROOT", "/etc/xboard-node")
+	defaultInstallRoot     = installRootDefault
+	defaultConfigPath      = filepath.Join(installRootDefault, "config.yml")
+	defaultMetaPath        = filepath.Join(installRootDefault, "install-meta.json")
+	defaultCredentialsPath = filepath.Join(installRootDefault, "credentials.env")
+	defaultBinaryPath      = envOr("LB_NODE_BINARY", "/usr/local/bin/xboard-node")
+	defaultCLIPath         = envOr("LB_NODE_CLI", "/usr/local/bin/xbctl")
+	serviceName            = envOr("LB_NODE_SERVICE", "xboard-node.service")
+	serviceFilePath        = filepath.Join("/etc/systemd/system", serviceName)
+	// 输出里的自称。和二进制名保持一致，免得 lbctl 打印出 "xboard-node status"
+	appName = envOr("LB_NODE_APP_NAME", filepath.Base(defaultBinaryPath))
 )
+
+func envOr(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
+}
 
 // 默认从本 fork 的 Releases 下载；可用环境变量 XBOARD_DOWNLOAD_BASE 覆盖
 var downloadBase = func() string {
@@ -61,7 +82,7 @@ type fileRootConfig struct {
 	WS        *config.WSConfig   `yaml:"ws,omitempty"`
 	Runtime   *fileRuntimeConfig `yaml:"runtime,omitempty"`
 	Cert      *config.CertConfig `yaml:"cert,omitempty"`
-	Instances []fileInstance      `yaml:"instances,omitempty"`
+	Instances []fileInstance     `yaml:"instances,omitempty"`
 }
 
 type fileInstance struct {
@@ -232,7 +253,7 @@ shortcuts:
 }
 
 func runStatus() error {
-	fmt.Println("xboard-node status")
+	fmt.Printf("%s status\n", appName)
 	fmt.Println()
 
 	// Version from install-meta.json
@@ -410,8 +431,10 @@ func runUpgrade(args []string) error {
 
 	binaryDir := filepath.Dir(defaultBinaryPath)
 	cliDir := filepath.Dir(defaultCLIPath)
-	newBinary := filepath.Join(binaryDir, ".xboard-node.new")
-	newCLI := filepath.Join(cliDir, ".xbctl.new")
+	// 临时文件名带上实际名字：两套 agent 并存时用同一个 ".xboard-node.new"
+	// 会互相踩
+	newBinary := filepath.Join(binaryDir, "."+filepath.Base(defaultBinaryPath)+".new")
+	newCLI := filepath.Join(cliDir, "."+filepath.Base(defaultCLIPath)+".new")
 
 	binaryURL := resolveDownloadURL(fmt.Sprintf("xboard-node-linux-%s", arch), version)
 	cliURL := resolveDownloadURL(fmt.Sprintf("xbctl-linux-%s", arch), version)

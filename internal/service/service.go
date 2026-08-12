@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -1221,7 +1222,7 @@ func (s *Service) pushAccessLogAsync() {
 // 节点实例，它们共用同一个二进制；任一实例触发升级即重启整进程，所以必须全进程只跑一次。
 var globalSelfUpdate atomic.Bool
 
-// triggerSelfUpdate launches `xbctl upgrade` detached from this service's systemd
+// triggerSelfUpdate launches the CLI's `upgrade` detached from this service's systemd
 // cgroup (via systemd-run --scope), so the upgrade's `systemctl restart` doesn't
 // kill the upgrade process itself. Process-wide guarded: in machine mode multiple
 // node instances share one binary, only one upgrade may run.
@@ -1230,8 +1231,15 @@ func (s *Service) triggerSelfUpdate(targetVersion string) {
 		return
 	}
 	nlog.Core().Warn("self-update requested by panel", "from", agentVersion, "to", targetVersion)
+	// **CLI 名字不能写死**：一台机器上并存两套 agent 时（迁移期新旧共存），
+	// 写死 "xbctl" 会让新 agent 的自升级去升老 agent —— 而且这是面板下发触发的，
+	// 没人在场。安装脚本会把 LB_NODE_CLI 写进 systemd 单元。
+	cli := strings.TrimSpace(os.Getenv("LB_NODE_CLI"))
+	if cli == "" {
+		cli = "xbctl"
+	}
 	cmd := exec.Command("systemd-run", "--scope", "--collect",
-		"xbctl", "upgrade", "--version", targetVersion)
+		cli, "upgrade", "--version", targetVersion)
 	if err := cmd.Start(); err != nil {
 		nlog.Core().Error("self-update launch failed", "error", err)
 		globalSelfUpdate.Store(false)

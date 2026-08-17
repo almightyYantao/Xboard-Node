@@ -80,6 +80,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	}
 
 	o.applyIntervals(nodesResp.BaseConfig)
+	o.applyAgentTarget(nodesResp.Agent)
 	nlog.Core().Info(fmt.Sprintf("machine %d: discovered %d nodes",
 		o.cfg.Machine.MachineID, len(nodesResp.Nodes)))
 
@@ -250,6 +251,22 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 	for _, n := range nodesResp.Nodes {
 		o.startNode(ctx, n) // no-op if already running
 	}
+	o.applyAgentTarget(nodesResp.Agent)
+}
+
+// applyAgentTarget 按面板下发的目标版本触发自更新。
+//
+// 节点侧也有一条同样的路径（访问日志回传里的 update.to），但那条路要求这台机器
+// **至少跑着一个节点**：面板上新建的机器、或节点全被停用的机器，只有这条通道能升级。
+// service.TriggerSelfUpdate 是进程级互斥的，两条路同时命中也只会升一次。
+func (o *Orchestrator) applyAgentTarget(target *panel.AgentTarget) {
+	if target == nil || target.TargetVersion == "" {
+		return
+	}
+	if target.TargetVersion == service.Version() {
+		return
+	}
+	service.TriggerSelfUpdate(target.TargetVersion)
 }
 
 // ─── Machine status reporting ────────────────────────────────────────────
@@ -262,6 +279,7 @@ func (o *Orchestrator) reportMachineStatus() {
 		[2]uint64{s.SwapTotal, s.SwapUsed},
 		[2]uint64{s.DiskTotal, s.DiskUsed},
 		s.NetInSpeed, s.NetOutSpeed,
+		service.Version(),
 	); err != nil {
 		nlog.Core().Warn("machine status report failed", "error", err)
 	}

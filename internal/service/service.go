@@ -1152,6 +1152,10 @@ func SetVersion(v string) {
 	}
 }
 
+// Version 返回当前二进制版本。给机器编排器用 —— 它也要上报版本、也要比对升级目标，
+// 但它不持有任何 Service（一台机器可以一个节点都没有）。
+func Version() string { return agentVersion }
+
 // accessLogPusher is the optional capability a control plane exposes to forward
 // per-connection access records, report agent state, and receive control
 // directives (enabled toggle + desired upgrade target). Only the panel
@@ -1226,7 +1230,10 @@ var globalSelfUpdate atomic.Bool
 // cgroup (via systemd-run --scope), so the upgrade's `systemctl restart` doesn't
 // kill the upgrade process itself. Process-wide guarded: in machine mode multiple
 // node instances share one binary, only one upgrade may run.
-func (s *Service) triggerSelfUpdate(targetVersion string) {
+func (s *Service) triggerSelfUpdate(targetVersion string) { TriggerSelfUpdate(targetVersion) }
+
+// TriggerSelfUpdate 是上面那段的包级入口，机器编排器（它没有 Service）也要用。
+func TriggerSelfUpdate(targetVersion string) {
 	if !globalSelfUpdate.CompareAndSwap(false, true) {
 		return
 	}

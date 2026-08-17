@@ -393,14 +393,18 @@ func (c *Client) GetMachineNodes() (*MachineNodesResponse, error) {
 	return &out, nil
 }
 
-// ReportMachineStatus sends machine-level load metrics to the panel.
+// ReportMachineStatus sends machine-level load metrics plus the running agent
+// version to the panel.
 // netIn/netOut are bytes/sec; negative values mean "unavailable" (first sample).
-func (c *Client) ReportMachineStatus(cpu float64, mem, swap, disk [2]uint64, netIn, netOut float64) error {
+func (c *Client) ReportMachineStatus(cpu float64, mem, swap, disk [2]uint64, netIn, netOut float64, agentVersion string) error {
 	payload := map[string]interface{}{
 		"cpu":  cpu,
 		"mem":  map[string]interface{}{"total": mem[0], "used": mem[1]},
 		"swap": map[string]interface{}{"total": swap[0], "used": swap[1]},
 		"disk": map[string]interface{}{"total": disk[0], "used": disk[1]},
+		// 面板「机器」列表的版本列只认这里 —— 节点通道上报的版本进的是另一张表。
+		// 一台机器可以一个节点都没有，那时这是面板知道版本的唯一途径。
+		"agent_version": agentVersion,
 	}
 	if netIn >= 0 && netOut >= 0 {
 		payload["net"] = map[string]interface{}{"in_speed": netIn, "out_speed": netOut}

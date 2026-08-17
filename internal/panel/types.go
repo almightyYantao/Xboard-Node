@@ -73,6 +73,14 @@ type MachineNode struct {
 type MachineNodesResponse struct {
 	Nodes      []MachineNode     `json:"nodes"`
 	BaseConfig MachineBaseConfig `json:"base_config"`
+	// Absent when the panel has no desired version configured.
+	Agent *AgentTarget `json:"agent"`
+}
+
+// AgentTarget is the panel's desired agent version for this machine.
+type AgentTarget struct {
+	TargetVersion string `json:"target_version"`
+	InstallerURL  string `json:"installer_url"`
 }
 
 // MachineBaseConfig holds polling intervals for machine mode.

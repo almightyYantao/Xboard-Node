@@ -59,7 +59,7 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	}
 
 	// Merge panel routes and static config routes
-	cfg["route"] = buildRoutes(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
+	cfg["route"] = buildRoutes(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute), nc.PrivateAllowCIDRs)
 
 	// Automatically enable rule_set caching (cache_file) when panel routes
 	// reference geoip:/geosite: entries so that the downloaded .srs rule_set
@@ -144,7 +144,7 @@ func mergeRouteList(a, b []map[string]any) []map[string]any {
 	return res
 }
 
-func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteRule, custom []map[string]any) M {
+func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteRule, custom []map[string]any, privateAllow []string) M {
 	var rules []M
 
 	// Structured custom routes now take the highest priority for panel-managed overrides.
@@ -158,6 +158,20 @@ func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteR
 	// Raw custom routes remain the escape hatch, but no longer outrank structured rules.
 	for _, cr := range custom {
 		rules = append(rules, M(cr))
+	}
+
+	// Panel-supplied allowlist for internal networks, emitted *before* the
+	// blanket private-range block below — sing-box takes the first matching rule.
+	//
+	// Reaching internal servers through the VPN is a legitimate use of this
+	// product; blocking every private range unconditionally made it impossible,
+	// and no panel-side route rule could undo it (they are appended after the
+	// block, so they were never reached).
+	//
+	// Link-local (169.254/16, cloud metadata) and loopback are rejected panel-side;
+	// filtered again here so a hand-edited config cannot open them.
+	if allow := sanitizePrivateAllow(privateAllow); len(allow) > 0 {
+		rules = append(rules, M{"outbound": "direct", "ip_cidr": allow})
 	}
 
 	// Standard blocks for private IPv4 and IPv6 ranges to prevent SSRF.
@@ -193,6 +207,31 @@ func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteR
 		"final": "direct",
 		"rules": rules,
 	}
+}
+
+// sanitizePrivateAllow drops entries that must never be reachable through a node,
+// no matter what the panel sent: cloud metadata (169.254.169.254 and the rest of
+// link-local) hands out cloud credentials, and loopback is the node itself —
+// allowing it would expose the agent's own admin ports to every VPN user.
+func sanitizePrivateAllow(cidrs []string) []string {
+	out := make([]string, 0, len(cidrs))
+	for _, raw := range cidrs {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		_, network, err := net.ParseCIDR(entry)
+		if err != nil {
+			nlog.Core().Warn(fmt.Sprintf("private allow: skipping invalid CIDR %q", entry))
+			continue
+		}
+		if network.IP.IsLinkLocalUnicast() || network.IP.IsLoopback() || network.IP.IsUnspecified() {
+			nlog.Core().Warn(fmt.Sprintf("private allow: refusing %q (link-local / loopback)", entry))
+			continue
+		}
+		out = append(out, network.String())
+	}
+	return out
 }
 
 func compilePanelRouteRule(pr model.RouteRule) []M {

@@ -10,14 +10,15 @@ type NodeSpec struct {
 	NetworkSettings map[string]any
 	Routes          []RouteRule
 
-	KernelType       string
-	KernelLogLevel   string
-	CustomOutbounds  []OutboundConfig
-	CustomRoutes     []map[string]any
-	CustomRouteRules []CustomRouteRule
-	CertConfig       *config.CertConfig
-	AutoTLS          bool
-	Domain           string
+	KernelType        string
+	KernelLogLevel    string
+	CustomOutbounds   []OutboundConfig
+	CustomRoutes      []map[string]any
+	CustomRouteRules  []CustomRouteRule
+	PrivateAllowCIDRs []string
+	CertConfig        *config.CertConfig
+	AutoTLS           bool
+	Domain            string
 
 	Cipher    string
 	Plugin    string

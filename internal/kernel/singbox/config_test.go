@@ -611,7 +611,7 @@ func TestBuildConfig_AllProtocols_ValidJSON(t *testing.T) {
 // --- Routes ---
 
 func TestBuildRoutes_Default(t *testing.T) {
-	route := buildRoutes(nil, nil, nil)
+	route := buildRoutes(nil, nil, nil, nil)
 	assertMapValue(t, route, "final", "direct")
 
 	rules := route["rules"].([]M)
@@ -628,7 +628,7 @@ func TestBuildRoutes_WithCustomRules(t *testing.T) {
 		{ID: 2, Match: []string{"10.0.0.0/8"}, Action: "block"},
 		{ID: 3, Match: []string{"allowed.com"}, Action: "direct"},
 	}
-	route := buildRoutes(testRouteRules(rules), nil, nil)
+	route := buildRoutes(testRouteRules(rules), nil, nil, nil)
 	allRules := route["rules"].([]M)
 
 	if len(allRules) != 5 {
@@ -653,7 +653,7 @@ func TestBuildRoutes_MultiMatch(t *testing.T) {
 		{ID: 1, Match: []string{"*.evil.com", "bad.org", "192.168.1.0/24"}, Action: "block"},
 		{ID: 2, Match: []string{"*.bypass.com"}, Action: "direct"},
 	}
-	route := buildRoutes(testRouteRules(rules), nil, nil)
+	route := buildRoutes(testRouteRules(rules), nil, nil, nil)
 	allRules := route["rules"].([]M)
 
 	// 2 default private-IP rules + 1 domain rule + 1 CIDR rule + 1 domain rule = 5
@@ -699,7 +699,7 @@ func TestBuildRoutes_WithCustomRouteRules(t *testing.T) {
 			Action: model.RouteAction{Type: "direct"},
 		},
 	}
-	route := buildRoutes(nil, customRules, nil)
+	route := buildRoutes(nil, customRules, nil, nil)
 	allRules := route["rules"].([]M)
 	if len(allRules) != 9 {
 		t.Fatalf("rules count: got %d, want 9", len(allRules))
@@ -733,7 +733,7 @@ func TestBuildRoutes_StructuredCustomRulesRemainFirst(t *testing.T) {
 		Match:  model.RouteMatch{DomainSuffixes: []string{"structured.example"}},
 		Action: model.RouteAction{Type: "direct"},
 	}}
-	route := buildRoutes(nil, custom, raw)
+	route := buildRoutes(nil, custom, raw, nil)
 	allRules := route["rules"].([]M)
 	if allRules[0]["outbound"] != "direct" {
 		t.Fatalf("expected structured route first, got %v", allRules[0]["outbound"])
@@ -885,5 +885,68 @@ func TestExtractECHInbound(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The panel can allow specific internal networks through a node. Reaching an
+// internal server over the VPN is a legitimate use; the blanket private-range
+// block made it impossible, and panel route rules could not undo it because they
+// are appended *after* the block.
+func TestPrivateAllowPrecedesTheBlock(t *testing.T) {
+	route := buildRoutes(nil, nil, nil, []string{"10.0.0.208/32", "192.168.7.0/24"})
+	rules, _ := route["rules"].([]M)
+
+	allowAt, blockAt := -1, -1
+	for i, rule := range rules {
+		cidrs, _ := rule["ip_cidr"].([]string)
+		switch rule["outbound"] {
+		case "direct":
+			if allowAt == -1 && len(cidrs) > 0 && cidrs[0] == "10.0.0.208/32" {
+				allowAt = i
+			}
+		case "block":
+			if blockAt == -1 && len(cidrs) > 0 && cidrs[0] == "10.0.0.0/8" {
+				blockAt = i
+			}
+		}
+	}
+
+	if allowAt == -1 {
+		t.Fatalf("allowlist rule missing: %+v", rules)
+	}
+	if blockAt == -1 {
+		t.Fatalf("private block missing — the SSRF guard must stay: %+v", rules)
+	}
+	if allowAt > blockAt {
+		t.Fatalf("allow rule (%d) must come before the block (%d), sing-box takes the first match", allowAt, blockAt)
+	}
+}
+
+// Cloud metadata (169.254.169.254) hands out cloud credentials and loopback is
+// the node itself. Rejected panel-side too — this is the second line.
+func TestPrivateAllowRefusesMetadataAndLoopback(t *testing.T) {
+	got := sanitizePrivateAllow([]string{
+		"169.254.169.254/32",
+		"169.254.0.0/16",
+		"127.0.0.1/32",
+		"0.0.0.0/0",
+		"not-a-cidr",
+		"10.0.0.208/32",
+	})
+	if len(got) != 1 || got[0] != "10.0.0.208/32" {
+		t.Fatalf("only the legitimate internal range should survive, got %v", got)
+	}
+}
+
+// No allowlist configured = previous behaviour, every private range blocked.
+func TestNoAllowlistKeepsEverythingBlocked(t *testing.T) {
+	route := buildRoutes(nil, nil, nil, nil)
+	rules, _ := route["rules"].([]M)
+	for _, rule := range rules {
+		if rule["outbound"] == "direct" {
+			if cidrs, _ := rule["ip_cidr"].([]string); len(cidrs) > 0 {
+				t.Fatalf("no allowlist was configured, but a direct ip_cidr rule appeared: %v", cidrs)
+			}
+		}
 	}
 }

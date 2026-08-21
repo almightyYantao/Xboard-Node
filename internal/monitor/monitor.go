@@ -16,14 +16,19 @@ import (
 
 var startTime = time.Now()
 
-func init() {
-	// Warm up the CPU sampler. The first cpu.Percent call with interval=0
-	// always returns 0% because it has no prior sample. This throwaway call
-	// seeds the baseline so subsequent Collect() calls return real values.
-	cpu.Percent(500*time.Millisecond, false)
+// minSampleInterval bounds how often the delta-based metrics (CPU busy %,
+// network throughput) are actually resampled. Collect() can be called
+// concurrently by multiple nodes/goroutines sharing this one process (e.g.
+// machine mode, or several nodes' push/WS tickers firing close together);
+// without this floor, two calls a few milliseconds apart would each see a
+// near-zero jiffy/byte delta and either divide-by-near-zero or (in
+// gopsutil's case) fall back to a meaningless 100%. Calls inside the window
+// simply reuse the last computed value, which is correct anyway since CPU
+// and host network throughput are machine-wide, not per-node, metrics.
+const minSampleInterval = time.Second
 
-	// Seed the network baseline so the first Collect() can compute rates.
-	collectNetSpeed()
+func init() {
+	refreshDeltaMetrics()
 }
 
 // Status holds system resource metrics
@@ -51,13 +56,26 @@ type Status struct {
 	LastPauseMS float64
 }
 
-// netBaseline tracks the previous network counters for rate calculation.
+// sampleMu guards every field below. All of it belongs to a single shared
+// baseline: CPU and network throughput are host-wide facts, so every caller
+// in this process (one per node, potentially) should observe the exact same
+// sampled value for the exact same instant rather than each computing its
+// own "since my last call" delta against shared OS counters.
 var (
-	netMu       sync.Mutex
-	netPrevRecv uint64
-	netPrevSent uint64
-	netPrevTime time.Time
-	netHasBase  bool
+	sampleMu       sync.Mutex
+	lastSampleTime time.Time
+	hasSample      bool
+
+	lastCPUTotal   cpu.TimesStat
+	lastCPUPerCore []cpu.TimesStat
+	cachedCPU      float64
+	cachedPerCore  []float64
+
+	netPrevRecv  uint64
+	netPrevSent  uint64
+	netPrevTime  time.Time
+	cachedNetIn  float64
+	cachedNetOut float64
 )
 
 // skipInterface returns true for loopback and common virtual interfaces.
@@ -71,50 +89,136 @@ func skipInterface(name string) bool {
 	return false
 }
 
-// collectNetSpeed calculates network in/out bytes per second since last call.
-// Returns -1, -1 on first call or if counters decreased (reboot).
-func collectNetSpeed() (inSpeed, outSpeed float64) {
-	counters, err := net.IOCounters(true) // per-interface
-	if err != nil {
-		nlog.Core().Debug("failed to get network counters", "error", err)
-		return -1, -1
+// cpuBusy splits a cpu.TimesStat into (total, busy) jiffy counts, mirroring
+// gopsutil's own internal getAllBusy so our delta math matches its semantics.
+func cpuBusy(t cpu.TimesStat) (total, busy float64) {
+	total = t.Total()
+	if runtime.GOOS == "linux" {
+		total -= t.Guest
+		total -= t.GuestNice
+	}
+	busy = total - t.Idle - t.Iowait
+	return total, busy
+}
+
+// cpuPercentDelta computes the busy percentage between two snapshots. Unlike
+// gopsutil's cpu.Percent, it never fabricates a 100% reading when the window
+// is too short to show a measurable jiffy delta — it just keeps the previous
+// value, which is far less misleading for a metric sampled every few seconds.
+func cpuPercentDelta(prev, curr cpu.TimesStat, fallback float64) float64 {
+	prevTotal, prevBusy := cpuBusy(prev)
+	currTotal, currBusy := cpuBusy(curr)
+
+	deltaTotal := currTotal - prevTotal
+	if deltaTotal <= 0 {
+		return fallback
+	}
+	deltaBusy := currBusy - prevBusy
+	if deltaBusy < 0 {
+		deltaBusy = 0
 	}
 
-	var totalRecv, totalSent uint64
-	for _, c := range counters {
-		if skipInterface(c.Name) {
-			continue
-		}
-		totalRecv += c.BytesRecv
-		totalSent += c.BytesSent
+	pct := deltaBusy / deltaTotal * 100
+	if pct < 0 {
+		pct = 0
+	} else if pct > 100 {
+		pct = 100
 	}
+	return pct
+}
+
+// refreshDeltaMetrics returns the current CPU busy % (overall + per-core)
+// and network in/out throughput (bytes/sec), resampling the underlying OS
+// counters at most once per minSampleInterval. Safe for concurrent use by
+// multiple nodes/goroutines within the same process.
+func refreshDeltaMetrics() (cpuPct float64, perCore []float64, netIn, netOut float64) {
+	sampleMu.Lock()
+	defer sampleMu.Unlock()
 
 	now := time.Now()
-
-	netMu.Lock()
-	defer netMu.Unlock()
-
-	if !netHasBase {
-		netPrevRecv, netPrevSent, netPrevTime, netHasBase = totalRecv, totalSent, now, true
-		return -1, -1
+	if hasSample && now.Sub(lastSampleTime) < minSampleInterval {
+		return cachedCPU, append([]float64(nil), cachedPerCore...), cachedNetIn, cachedNetOut
 	}
 
-	elapsed := now.Sub(netPrevTime).Seconds()
-	if elapsed <= 0 {
-		return -1, -1
+	totalTimes, cpuErr := cpu.Times(false)
+	var perCoreTimes []cpu.TimesStat
+	if cpuErr == nil && len(totalTimes) > 0 {
+		perCoreTimes, _ = cpu.Times(true)
+	} else if cpuErr != nil {
+		nlog.Core().Debug("failed to get CPU times", "error", cpuErr)
 	}
 
-	// Counter decreased → system reboot or interface reset; reset baseline.
-	if totalRecv < netPrevRecv || totalSent < netPrevSent {
+	counters, netErr := net.IOCounters(true)
+	var totalRecv, totalSent uint64
+	if netErr == nil {
+		for _, c := range counters {
+			if skipInterface(c.Name) {
+				continue
+			}
+			totalRecv += c.BytesRecv
+			totalSent += c.BytesSent
+		}
+	} else {
+		nlog.Core().Debug("failed to get network counters", "error", netErr)
+	}
+
+	if !hasSample {
+		hasSample = true
+		lastSampleTime = now
+		if cpuErr == nil && len(totalTimes) > 0 {
+			lastCPUTotal = totalTimes[0]
+			lastCPUPerCore = perCoreTimes
+		}
+		cachedCPU = 0
+		cachedPerCore = make([]float64, len(perCoreTimes))
+		if netErr == nil {
+			netPrevRecv, netPrevSent, netPrevTime = totalRecv, totalSent, now
+		}
+		cachedNetIn, cachedNetOut = -1, -1
+		return cachedCPU, append([]float64(nil), cachedPerCore...), cachedNetIn, cachedNetOut
+	}
+
+	if cpuErr == nil && len(totalTimes) > 0 {
+		cachedCPU = cpuPercentDelta(lastCPUTotal, totalTimes[0], cachedCPU)
+
+		if len(perCoreTimes) > 0 && len(perCoreTimes) == len(lastCPUPerCore) {
+			pc := make([]float64, len(perCoreTimes))
+			for i := range perCoreTimes {
+				fallback := 0.0
+				if i < len(cachedPerCore) {
+					fallback = cachedPerCore[i]
+				}
+				pc[i] = cpuPercentDelta(lastCPUPerCore[i], perCoreTimes[i], fallback)
+			}
+			cachedPerCore = pc
+		} else {
+			cachedPerCore = make([]float64, len(perCoreTimes))
+		}
+
+		lastCPUTotal = totalTimes[0]
+		lastCPUPerCore = perCoreTimes
+	}
+
+	if netErr == nil {
+		// Measured against netPrevTime (not the shared lastSampleTime) so a
+		// transient failure of one metric on a given round can never desync
+		// the byte-delta from the wall-clock window it was actually measured
+		// over — netPrevRecv/Sent/Time always advance together.
+		netElapsed := now.Sub(netPrevTime).Seconds()
+		switch {
+		case totalRecv < netPrevRecv || totalSent < netPrevSent:
+			// Counter decreased: reboot or interface reset. Reset baseline.
+			cachedNetIn, cachedNetOut = -1, -1
+		case netElapsed > 0:
+			cachedNetIn = float64(totalRecv-netPrevRecv) / netElapsed
+			cachedNetOut = float64(totalSent-netPrevSent) / netElapsed
+		}
 		netPrevRecv, netPrevSent, netPrevTime = totalRecv, totalSent, now
-		return -1, -1
 	}
 
-	inSpeed = float64(totalRecv-netPrevRecv) / elapsed
-	outSpeed = float64(totalSent-netPrevSent) / elapsed
+	lastSampleTime = now
 
-	netPrevRecv, netPrevSent, netPrevTime = totalRecv, totalSent, now
-	return inSpeed, outSpeed
+	return cachedCPU, append([]float64(nil), cachedPerCore...), cachedNetIn, cachedNetOut
 }
 
 // Collect gathers current system metrics
@@ -123,16 +227,7 @@ func Collect() Status {
 
 	s.Uptime = uint64(time.Since(startTime).Seconds())
 
-	if cpuPercent, err := cpu.Percent(0, false); err == nil && len(cpuPercent) > 0 {
-		s.CPU = cpuPercent[0]
-	} else if err != nil {
-		nlog.Core().Debug("failed to get CPU usage", "error", err)
-	}
-
-	// Per-core CPU usage (best-effort; safe if it fails).
-	if perCore, err := cpu.Percent(0, true); err == nil && len(perCore) > 0 {
-		s.CPUPerCore = perCore
-	}
+	s.CPU, s.CPUPerCore, s.NetInSpeed, s.NetOutSpeed = refreshDeltaMetrics()
 
 	if loadAvg, err := load.Avg(); err == nil {
 		s.Load1 = loadAvg.Load1
@@ -154,8 +249,6 @@ func Collect() Status {
 		s.DiskTotal = diskStat.Total
 		s.DiskUsed = diskStat.Used
 	}
-
-	s.NetInSpeed, s.NetOutSpeed = collectNetSpeed()
 
 	// GC metrics
 	var ms runtime.MemStats

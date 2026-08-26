@@ -124,7 +124,80 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 		Multiplex:           multiplex,
 		AcceptProxyProtocol: nc.AcceptProxyProtocol,
 		AutoThrottle:        autoThrottleFromPanel(nc.AutoThrottle),
+		ACL:                 aclFromPanel(nc.ACL),
 	}
+}
+
+func aclFromPanel(a *panel.ACLConfig) *ACLConfig {
+	if a == nil {
+		return nil
+	}
+	out := &ACLConfig{
+		Mode:          a.Mode,
+		DefaultAction: a.DefaultAction,
+		Groups:        make([]ACLGroup, 0, len(a.Groups)),
+	}
+	if a.ImplicitDNSAllow != nil {
+		v := *a.ImplicitDNSAllow
+		out.ImplicitDNSAllow = &v
+	}
+	for _, g := range a.Groups {
+		group := ACLGroup{
+			ID:            g.ID,
+			Priority:      g.Priority,
+			DefaultAction: g.DefaultAction,
+			Rules:         make([]ACLRule, 0, len(g.Rules)),
+		}
+		for _, r := range g.Rules {
+			group.Rules = append(group.Rules, ACLRule{
+				Action:         r.Action,
+				Priority:       r.Priority,
+				IPCIDRs:        cloneStringSlice(r.IPCIDRs),
+				Domains:        cloneStringSlice(r.Domains),
+				DomainSuffixes: cloneStringSlice(r.DomainSuffixes),
+				Ports:          cloneStringSlice(r.Ports),
+				Protocols:      cloneStringSlice(r.Protocols),
+			})
+		}
+		out.Groups = append(out.Groups, group)
+	}
+	return out
+}
+
+func aclToPanel(a *ACLConfig) *panel.ACLConfig {
+	if a == nil {
+		return nil
+	}
+	out := &panel.ACLConfig{
+		Mode:          a.Mode,
+		DefaultAction: a.DefaultAction,
+		Groups:        make([]panel.ACLGroup, 0, len(a.Groups)),
+	}
+	if a.ImplicitDNSAllow != nil {
+		v := *a.ImplicitDNSAllow
+		out.ImplicitDNSAllow = &v
+	}
+	for _, g := range a.Groups {
+		group := panel.ACLGroup{
+			ID:            g.ID,
+			Priority:      g.Priority,
+			DefaultAction: g.DefaultAction,
+			Rules:         make([]panel.ACLRule, 0, len(g.Rules)),
+		}
+		for _, r := range g.Rules {
+			group.Rules = append(group.Rules, panel.ACLRule{
+				Action:         r.Action,
+				Priority:       r.Priority,
+				IPCIDRs:        cloneStringSlice(r.IPCIDRs),
+				Domains:        cloneStringSlice(r.Domains),
+				DomainSuffixes: cloneStringSlice(r.DomainSuffixes),
+				Ports:          cloneStringSlice(r.Ports),
+				Protocols:      cloneStringSlice(r.Protocols),
+			})
+		}
+		out.Groups = append(out.Groups, group)
+	}
+	return out
 }
 
 func autoThrottleFromPanel(at *panel.AutoThrottleConfig) *AutoThrottleConfig {
@@ -167,7 +240,13 @@ func UserSpecsFromPanel(users []panel.User) []UserSpec {
 	}
 	out := make([]UserSpec, 0, len(users))
 	for _, user := range users {
-		out = append(out, UserSpec{ID: user.ID, UUID: user.UUID, SpeedLimit: user.SpeedLimit, DeviceLimit: user.DeviceLimit})
+		out = append(out, UserSpec{
+			ID:          user.ID,
+			UUID:        user.UUID,
+			SpeedLimit:  user.SpeedLimit,
+			DeviceLimit: user.DeviceLimit,
+			ACLGroups:   cloneStringSlice(user.ACLGroups),
+		})
 	}
 	return out
 }
@@ -291,6 +370,7 @@ func (n *NodeSpec) ToPanel() *panel.NodeConfig {
 		Multiplex:           multiplex,
 		AcceptProxyProtocol: n.AcceptProxyProtocol,
 		AutoThrottle:        autoThrottleToPanel(n.AutoThrottle),
+		ACL:                 aclToPanel(n.ACL),
 	}
 }
 
@@ -300,7 +380,13 @@ func UserSpecsToPanel(users []UserSpec) []panel.User {
 	}
 	out := make([]panel.User, 0, len(users))
 	for _, user := range users {
-		out = append(out, panel.User{ID: user.ID, UUID: user.UUID, SpeedLimit: user.SpeedLimit, DeviceLimit: user.DeviceLimit})
+		out = append(out, panel.User{
+			ID:          user.ID,
+			UUID:        user.UUID,
+			SpeedLimit:  user.SpeedLimit,
+			DeviceLimit: user.DeviceLimit,
+			ACLGroups:   cloneStringSlice(user.ACLGroups),
+		})
 	}
 	return out
 }

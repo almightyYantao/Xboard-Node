@@ -29,6 +29,7 @@ import (
 
 	_ "github.com/xtls/xray-core/main/distro/all"
 
+	"github.com/cedar2025/xboard-node/internal/acl"
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
@@ -68,6 +69,10 @@ type Xray struct {
 	lastKernelHash  string
 	cumTraffic      map[int][2]int64
 	speedLimitFunc  func(string) *rate.Limiter
+	// aclFunc is remembered here because Start builds a fresh
+	// LimitDispatcher; without it, every kernel restart would silently drop
+	// ACL enforcement until the next panel push.
+	aclFunc func(string) *acl.Policy
 
 	// running is set after a successful Start and cleared before shutdown.
 	// Atomic so IsRunning / GetConnections never block.
@@ -156,8 +161,15 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.inboundTag = nodeConfig.Protocol + "-in"
 	x.cumTraffic = make(map[int][2]int64)
 	x.lastKernelHash = kernel.ComputeHash(nodeConfig, users)
+	aclFunc := x.aclFunc
 	x.running.Store(true)
 	x.mu.Unlock()
+
+	// The dispatcher is new on every Start, so re-arm ACL before traffic can
+	// reach it — otherwise a restart would leave the node open.
+	if ld != nil && aclFunc != nil {
+		ld.SetACLFunc(aclFunc)
+	}
 
 	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
 	closeOld(old, oldLD)
@@ -268,6 +280,19 @@ func (x *Xray) SetSpeedLimitFunc(fn func(string) *rate.Limiter) {
 // SetDeviceLimitFunc is a no-op for xray — device limits are already
 // gate-kept by LimitDispatcher.checkDeviceLimit at Dispatch time.
 func (x *Xray) SetDeviceLimitFunc(_ func(string) (int, bool)) {}
+
+// SetACLFunc installs the per-user destination policy resolver on the
+// dispatcher. The resolver is remembered so it survives the full restart
+// xray performs whenever the kernel config hash changes.
+func (x *Xray) SetACLFunc(fn func(string) *acl.Policy) {
+	x.mu.Lock()
+	x.aclFunc = fn
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+	if ld != nil {
+		ld.SetACLFunc(fn)
+	}
+}
 
 // UpdateGlobalDevices is a no-op for xray — xray handles device limits differently.
 func (x *Xray) UpdateGlobalDevices(_ map[int][]string) {}

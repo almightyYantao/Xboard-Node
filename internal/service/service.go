@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/acl"
 	"github.com/cedar2025/xboard-node/internal/cert"
 	"github.com/cedar2025/xboard-node/internal/cert/dnsproviders"
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -37,6 +38,7 @@ type Service struct {
 	kernel       kernel.Kernel
 	tracker      *tracker.Tracker
 	limiter      *limiter.Limiter
+	acl          *acl.Store
 	speedTracker *limiter.SpeedTracker
 	autoThrottle *limiter.AutoThrottle
 	cert         *cert.Manager
@@ -163,6 +165,7 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		kernel:       k,
 		tracker:      tracker.New(),
 		limiter:      l,
+		acl:          acl.New(),
 		speedTracker: st,
 		autoThrottle: limiter.NewAutoThrottle(),
 		cert:         certMgr,
@@ -253,6 +256,7 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	// Register speed limit lookup with kernel unconditionally (before push/poll branch).
 	s.kernel.SetSpeedLimitFunc(s.speedTracker.GetLimiter)
 	s.kernel.SetDeviceLimitFunc(s.limiter.GetDeviceLimitByUUID)
+	s.kernel.SetACLFunc(s.acl.Lookup)
 	s.kernel.SetAccessLogEnabled(s.cfg.Node.AccessLog)
 
 	bootstrap, err := s.source.Initial(ctx, s.wsMetrics, s.wsEvents, s.wsStatusCh)
@@ -733,6 +737,7 @@ func (s *Service) prepareUserState(users []model.UserSpec) (prevUsers []model.Us
 	s.lastUsers = append([]model.UserSpec(nil), users...)
 	s.metricsMu.Unlock()
 	s.lastUserHash = computeUserHash(users)
+	s.refreshACL()
 	return prevUsers, prevHash
 }
 
@@ -746,6 +751,28 @@ func (s *Service) restoreUserState(users []model.UserSpec, hash string) {
 	s.lastUsers = append([]model.UserSpec(nil), users...)
 	s.metricsMu.Unlock()
 	s.lastUserHash = hash
+	s.refreshACL()
+}
+
+// refreshACL recompiles the policy set from the current config and user list.
+//
+// This runs on every user-state change rather than only on config changes,
+// because group membership travels with the users, not with the ACL config.
+// A failed recompile leaves the previous policy live: dropping to "no policy"
+// would quietly open a node the operator believes is locked down.
+func (s *Service) refreshACL() {
+	s.metricsMu.RLock()
+	users := s.lastUsers
+	s.metricsMu.RUnlock()
+
+	var cfg *model.ACLConfig
+	if s.lastConfig != nil {
+		cfg = s.lastConfig.ACL
+	}
+
+	if err := s.acl.Update(cfg, users); err != nil {
+		nlog.Core().Error("acl update rejected, keeping previous policy", "error", err)
+	}
 }
 
 // startKernel starts (or restarts) the kernel with the given config/users and
@@ -929,6 +956,10 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 	if !configChanged {
 		return
 	}
+
+	// ACL lives outside the kernel, so it has to be refreshed even when the
+	// kernel path below bails out (no users yet, or kernel stopped).
+	s.refreshACL()
 
 	if s.lastConfig == nil || len(s.lastUsers) == 0 {
 		if len(s.lastUsers) == 0 {
@@ -1429,6 +1460,13 @@ func computeConfigHash(cfg *model.NodeSpec) string {
 	// so the robustness of capturing all fields outweighs the micro-performance of manual hashing.
 	data, _ := json.Marshal(cfg)
 	h.Write(data)
+	// ACL is tagged json:"-" so that kernel.ComputeHash cannot see it — a
+	// policy edit must never restart xray. It still has to reach this hash,
+	// or the service would not notice a panel push that only changed ACL.
+	if cfg.ACL != nil {
+		aclData, _ := json.Marshal(cfg.ACL)
+		h.Write(aclData)
+	}
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
@@ -1449,6 +1487,13 @@ func computeUserHash(users []model.UserSpec) string {
 		h.Write(buf[:])
 		binary.LittleEndian.PutUint64(buf[:], uint64(u.DeviceLimit))
 		h.Write(buf[:])
+		// ACL group membership rides along with the user record, so a
+		// re-grouped user has to register as a user change or the new policy
+		// would never be compiled.
+		for _, g := range u.ACLGroups {
+			io.WriteString(h, "\x00")
+			io.WriteString(h, g)
+		}
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
 }

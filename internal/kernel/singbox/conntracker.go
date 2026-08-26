@@ -16,6 +16,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/time/rate"
 
+	"github.com/cedar2025/xboard-node/internal/acl"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
@@ -150,6 +151,10 @@ type ConnTracker struct {
 	// deviceLimitFunc resolves a user UUID to their device limit.
 	deviceLimitFunc atomic.Pointer[func(uuid string) (int, bool)]
 
+	// aclFunc resolves a user UUID to their destination policy.
+	aclFunc    atomic.Pointer[func(uuid string) *acl.Policy]
+	aclDenials atomic.Uint64
+
 	// Multi-node device state from panel
 	globalDevices    map[int]map[string]bool // userID → IP → exists
 	globalMu         sync.RWMutex
@@ -279,6 +284,57 @@ func (t *ConnTracker) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 	t.deviceLimitFunc.Store(&fn)
 }
 
+// SetACLFunc configures the per-user destination policy lookup. Passing nil
+// disables ACL checks.
+func (t *ConnTracker) SetACLFunc(fn func(uuid string) *acl.Policy) {
+	if fn == nil {
+		t.aclFunc.Store(nil)
+		return
+	}
+	t.aclFunc.Store(&fn)
+}
+
+// ACLDenials returns the number of connections the ACL rejected (or would
+// have rejected, in dry-run) since this tracker was created.
+func (t *ConnTracker) ACLDenials() uint64 { return t.aclDenials.Load() }
+
+// aclRejects reports whether the user's policy forbids this destination.
+//
+// sing-box calls the tracker after routing has picked an outbound, so the
+// only way to refuse is to close the connection. That is the same mechanism
+// the device-limit gate already uses.
+func (t *ConnTracker) aclRejects(uuid string, metadata adapter.InboundContext, udp bool) bool {
+	fn := t.aclFunc.Load()
+	if fn == nil {
+		return false
+	}
+	policy := (*fn)(uuid)
+	if !policy.Restricted() {
+		return false
+	}
+
+	dest := acl.Dest{Port: metadata.Destination.Port, UDP: udp}
+	if fqdn := metadata.Destination.Fqdn; fqdn != "" {
+		dest.Domain = strings.ToLower(fqdn)
+	} else if addr := metadata.Destination.Addr; addr.IsValid() {
+		dest.IP = addr.Unmap()
+	}
+
+	if policy.Check(dest) == acl.ActionAllow {
+		return false
+	}
+
+	t.aclDenials.Add(1)
+	if policy.DryRun() {
+		nlog.Core().Info("singbox: acl would deny (dryrun)",
+			"user", uuid, "dest", metadata.Destination.String())
+		return false
+	}
+	nlog.Core().Debug("singbox: acl denied",
+		"user", uuid, "dest", metadata.Destination.String())
+	return true
+}
+
 // SetUserMap replaces the UUID→userID mapping and ensures per-user stats
 // structs exist for all users. Old users that are no longer present keep
 // their stats until their connections drain.
@@ -334,6 +390,12 @@ func (t *ConnTracker) RoutedConnection(
 	uid := t.uuidMap[uuid]
 	us := t.users[uid]
 	t.usersMu.RUnlock()
+
+	// ACL first: a forbidden destination should not burn a device slot.
+	if t.aclRejects(uuid, metadata, false) {
+		conn.Close()
+		return conn
+	}
 
 	// Device limit gate-keeping
 	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
@@ -397,6 +459,12 @@ func (t *ConnTracker) RoutedPacketConnection(
 	uid := t.uuidMap[uuid]
 	us := t.users[uid]
 	t.usersMu.RUnlock()
+
+	// ACL first: a forbidden destination should not burn a device slot.
+	if t.aclRejects(uuid, metadata, true) {
+		conn.Close()
+		return conn
+	}
 
 	// Device limit gate-keeping
 	if dlf := t.deviceLimitFunc.Load(); dlf != nil {

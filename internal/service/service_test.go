@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cedar2025/xboard-node/internal/acl"
 	"github.com/cedar2025/xboard-node/internal/cert"
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
@@ -32,6 +33,7 @@ type fakeKernel struct {
 
 	speedLimitFunc  func(string) *rate.Limiter
 	deviceLimitFunc func(string) (int, bool)
+	aclFunc         func(string) *acl.Policy
 }
 
 func (f *fakeKernel) Name() string { return "fake" }
@@ -93,6 +95,7 @@ func (f *fakeKernel) CloseUserConnections(ctx context.Context, uuid string) erro
 }
 func (f *fakeKernel) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) { f.speedLimitFunc = fn }
 func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) { f.deviceLimitFunc = fn }
+func (f *fakeKernel) SetACLFunc(fn func(identity string) *acl.Policy)     { f.aclFunc = fn }
 func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string) { _ = users }
 func (f *fakeKernel) ClearGlobalDevices() {}
 func (f *fakeKernel) SetAccessLogEnabled(bool)            {}
@@ -103,11 +106,13 @@ func newTestService(k *fakeKernel) *Service {
 	s := &Service{
 		kernel:       k,
 		limiter:      sharedLimiter,
+		acl:          acl.New(),
 		speedTracker: limiter.NewSpeedTracker(sharedLimiter),
 		cert:         cert.NewManager(config.CertConfig{}),
 	}
 	k.SetSpeedLimitFunc(s.speedTracker.GetLimiter)
 	k.SetDeviceLimitFunc(s.limiter.GetDeviceLimitByUUID)
+	k.SetACLFunc(s.acl.Lookup)
 	return s
 }
 

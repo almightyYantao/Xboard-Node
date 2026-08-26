@@ -49,6 +49,17 @@ type NodeSpec struct {
 
 	// AutoThrottle is the panel-pushed auto-mitigation policy. Nil = disabled.
 	AutoThrottle *AutoThrottleConfig
+
+	// ACL is the per-user destination policy. Nil = the panel said nothing,
+	// so no enforcement happens at all.
+	//
+	// The json:"-" tag is load-bearing, not cosmetic. kernel.ComputeHash
+	// marshals NodeSpec to decide whether the kernel must be rebuilt, and
+	// xray answers a changed hash with a full restart that drops every live
+	// connection. ACL is enforced in-process and needs none of that, so it
+	// must stay out of the hash. The service folds it into its own config
+	// hash separately (see computeConfigHash) so changes are still noticed.
+	ACL *ACLConfig `json:"-"`
 }
 
 // AutoThrottleConfig is the node-side auto-mitigation policy: when a user's
@@ -99,6 +110,10 @@ type UserSpec struct {
 	UUID        string
 	SpeedLimit  int
 	DeviceLimit int
+	// ACLGroups names the ACL groups this user belongs to, already flattened
+	// and deduplicated by the panel. Empty = no group, so the node default
+	// applies.
+	ACLGroups []string
 }
 
 func (n *NodeSpec) GetProxyProtocol() bool {

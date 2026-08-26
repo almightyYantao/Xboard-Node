@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing/service"
 	"golang.org/x/time/rate"
 
+	"github.com/cedar2025/xboard-node/internal/acl"
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
@@ -57,6 +58,10 @@ type SingBox struct {
 	// deviceLimitFunc resolves a user UUID to (limit, hasLimit) for gate-keeping.
 	// Set once by SetDeviceLimitFunc and forwarded to every new ConnTracker.
 	deviceLimitFunc func(string) (int, bool)
+
+	// aclFunc resolves a user UUID to their destination policy.
+	// Set once by SetACLFunc and forwarded to every new ConnTracker.
+	aclFunc func(string) *acl.Policy
 
 	// trackerRegistered prevents duplicate AppendTracker calls on the same
 	// Router instance during Reload. Reset to false on full restart.
@@ -167,6 +172,9 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	}
 	if s.deviceLimitFunc != nil {
 		s.connTracker.SetDeviceLimitFunc(s.deviceLimitFunc)
+	}
+	if s.aclFunc != nil {
+		s.connTracker.SetACLFunc(s.aclFunc)
 	}
 	s.connTracker.SetAccessLogEnabled(s.accessLogEnabled)
 
@@ -424,6 +432,17 @@ func (s *SingBox) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 	s.deviceLimitFunc = fn
 	if s.connTracker != nil {
 		s.connTracker.SetDeviceLimitFunc(fn)
+	}
+}
+
+// SetACLFunc configures per-user destination access control. The resolver is
+// remembered so a full restart, which builds a fresh ConnTracker, re-arms it.
+func (s *SingBox) SetACLFunc(fn func(uuid string) *acl.Policy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.aclFunc = fn
+	if s.connTracker != nil {
+		s.connTracker.SetACLFunc(fn)
 	}
 }
 

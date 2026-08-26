@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/cedar2025/xboard-node/internal/acl"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"golang.org/x/time/rate"
 )
@@ -97,6 +98,14 @@ type Kernel interface {
 	// The function resolves a user UUID to (limit, hasLimit).
 	// Kernels that already gate-keep internally (e.g. xray) may no-op.
 	SetDeviceLimitFunc(fn func(uuid string) (int, bool))
+	// SetACLFunc configures per-user destination access control.
+	//
+	// The function resolves a kernel-native user identity to a compiled
+	// policy: sing-box passes the inbound user name (the UUID), xray passes
+	// the stats email. acl.Store indexes both, so each kernel can hand over
+	// whatever it already has at the hook without an extra lookup. A nil fn
+	// or a nil policy means the user is unrestricted.
+	SetACLFunc(fn func(identity string) *acl.Policy)
 	// UpdateGlobalDevices updates the global device state from panel (for multi-node).
 	UpdateGlobalDevices(users map[int][]string)
 	// ClearGlobalDevices clears the global device state (on WS disconnect).

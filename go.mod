@@ -32,7 +32,7 @@ require (
 	github.com/sagernet/sing-box v1.13.2
 	github.com/shirou/gopsutil/v4 v4.26.2
 	github.com/xtls/xray-core v1.260327.0
-	golang.org/x/net v0.52.0
+	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
 	golang.org/x/term v0.41.0
 	golang.org/x/time v0.12.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -239,10 +239,10 @@ require (
 	go.uber.org/zap v1.27.1 // indirect
 	go.uber.org/zap/exp v0.3.0 // indirect
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745 // indirect
-	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	golang.org/x/crypto v0.49.0 // indirect
 	golang.org/x/exp v0.0.0-20251219203646-944ab1f22d93 // indirect
 	golang.org/x/mod v0.33.0 // indirect
+	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect

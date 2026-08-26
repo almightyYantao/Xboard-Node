@@ -161,6 +161,42 @@ type NodeConfig struct {
 
 	// AutoThrottle is the node-side auto-mitigation policy (Xboard extension).
 	AutoThrottle *AutoThrottleConfig `json:"auto_throttle,omitempty"`
+
+	// ACL is the per-user destination policy. A pointer so that "the panel
+	// never mentioned ACL" (nil) stays distinguishable from "the panel sent
+	// a policy that happens to be empty" — the first must behave exactly as
+	// the node did before ACL existed. See docs-user-acl.md §3.4.
+	ACL *ACLConfig `json:"acl,omitempty"`
+}
+
+// ACLConfig mirrors model.ACLConfig on the wire.
+type ACLConfig struct {
+	Mode          string `json:"mode"`
+	DefaultAction string `json:"default_action"`
+	// ImplicitDNSAllow is a pointer so an omitted field means "default true"
+	// rather than "false" — losing DNS under a deny default makes a healthy
+	// node look dead.
+	ImplicitDNSAllow *bool      `json:"implicit_dns_allow,omitempty"`
+	Groups           []ACLGroup `json:"groups,omitempty"`
+}
+
+// ACLGroup mirrors model.ACLGroup on the wire.
+type ACLGroup struct {
+	ID            string    `json:"id"`
+	Priority      int       `json:"priority,omitempty"`
+	DefaultAction string    `json:"default_action,omitempty"`
+	Rules         []ACLRule `json:"rules,omitempty"`
+}
+
+// ACLRule mirrors model.ACLRule on the wire.
+type ACLRule struct {
+	Action         string   `json:"action"`
+	Priority       int      `json:"priority,omitempty"`
+	IPCIDRs        []string `json:"ip_cidrs,omitempty"`
+	Domains        []string `json:"domains,omitempty"`
+	DomainSuffixes []string `json:"domain_suffixes,omitempty"`
+	Ports          []string `json:"ports,omitempty"`
+	Protocols      []string `json:"protocols,omitempty"`
 }
 
 // AutoThrottleConfig mirrors model.AutoThrottleConfig on the wire.
@@ -284,6 +320,9 @@ type User struct {
 	UUID        string `json:"uuid"`
 	SpeedLimit  int    `json:"speed_limit"`  // Mbps, 0 = unlimited
 	DeviceLimit int    `json:"device_limit"` // max devices, 0 = unlimited
+	// ACLGroups lists the ACL group IDs this user belongs to, already merged
+	// and deduplicated panel-side. Absent or empty = no group.
+	ACLGroups []string `json:"acl_groups,omitempty"`
 }
 
 type UsersResponse struct {

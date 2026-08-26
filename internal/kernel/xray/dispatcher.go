@@ -3,8 +3,10 @@ package xray
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	_ "unsafe"
@@ -17,6 +19,7 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
 
+	"github.com/cedar2025/xboard-node/internal/acl"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
@@ -81,6 +84,13 @@ type LimitDispatcher struct {
 	unlimitedIPs sync.Map // email → *ipCounter
 
 	connCount atomic.Int64 // total active connections tracked by dispatcher
+
+	// aclFunc resolves a stats email to its ACL policy. Held as an atomic
+	// pointer rather than under mu so the check adds no lock traffic to a
+	// path that already contends on device limits.
+	aclFunc atomic.Pointer[func(string) *acl.Policy]
+
+	aclDenials atomic.Uint64
 }
 
 // ipCounter tracks IPs for unlimited users without any lock.
@@ -146,12 +156,64 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 	sourceIP = si.Source.Address.IP().String()
 	isTCP = dest.Network == net.Network_TCP
 
+	// ACL runs before the device-limit check: a destination the user may not
+	// reach should not consume one of their device slots.
+	if err := d.checkACL(email, dest, isTCP); err != nil {
+		return "", "", false, err
+	}
+
 	if d.checkDeviceLimit(email, sourceIP, isTCP) {
 		nlog.Core().Debug("xray: device limit exceeded", "email", email, "ip", sourceIP)
 		return "", "", false, errors.New("device limit exceeded for " + email)
 	}
 	return email, sourceIP, isTCP, nil
 }
+
+// checkACL evaluates the user's destination policy. It returns a non-nil
+// error only when the connection must be rejected.
+func (d *LimitDispatcher) checkACL(email string, dest net.Destination, isTCP bool) error {
+	fn := d.aclFunc.Load()
+	if fn == nil {
+		return nil
+	}
+	policy := (*fn)(email)
+	if !policy.Restricted() {
+		return nil
+	}
+
+	target := acl.Dest{Port: uint16(dest.Port), UDP: !isTCP}
+	if dest.Address.Family().IsDomain() {
+		target.Domain = strings.ToLower(dest.Address.Domain())
+	} else if addr, ok := netip.AddrFromSlice(dest.Address.IP()); ok {
+		target.IP = addr.Unmap()
+	}
+
+	if policy.Check(target) == acl.ActionAllow {
+		return nil
+	}
+
+	d.aclDenials.Add(1)
+	if policy.DryRun() {
+		nlog.Core().Info("xray: acl would deny (dryrun)",
+			"email", email, "dest", dest.String())
+		return nil
+	}
+	nlog.Core().Debug("xray: acl denied", "email", email, "dest", dest.String())
+	return errors.New("destination not permitted for " + email)
+}
+
+// SetACLFunc installs the policy resolver. Passing nil disables ACL checks.
+func (d *LimitDispatcher) SetACLFunc(fn func(string) *acl.Policy) {
+	if fn == nil {
+		d.aclFunc.Store(nil)
+		return
+	}
+	d.aclFunc.Store(&fn)
+}
+
+// ACLDenials returns the number of connections the ACL rejected (or would
+// have rejected, in dry-run) since process start.
+func (d *LimitDispatcher) ACLDenials() uint64 { return d.aclDenials.Load() }
 
 // trackLink records connection lifecycle without mutating xray-core owned
 // transport primitives. This keeps mux/XUDP compatible while still allowing

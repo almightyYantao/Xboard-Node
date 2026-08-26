@@ -88,6 +88,16 @@ func (s *SingBox) DrainAccessLog() []model.AccessRecord {
 	return nil
 }
 
+// ACLDenials returns the exact number of connections the ACL rejected (or
+// would have rejected, in dry-run) since the current tracker was created.
+// Records may be sampled when the buffer fills; this count never is.
+func (s *SingBox) ACLDenials() uint64 {
+	if s.connTracker != nil {
+		return s.connTracker.ACLDenials()
+	}
+	return 0
+}
+
 func New(cfg config.KernelConfig) *SingBox {
 	return &SingBox{cfg: cfg}
 }

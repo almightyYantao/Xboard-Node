@@ -274,9 +274,53 @@ check(user, dest_ip, dest_domain, port, proto):
 | `dryrun` | 正常判定，**放行**，把"本应拦截"的连接写入 access log 并上报 | 提供查询视图 |
 | `enforce` | 判定并拦截 | 切换时二次确认 |
 
-dryrun 上报复用现有 access log 通道 `POST /api/v1/server/UniProxy/accesslog`
-（`client.go:308`），记录里增加 ACL 判定结果字段。面板侧要能按"用户 / 组 / 命中规则"
-聚合，让运营在切 enforce 前看到影响面。
+### 7.1 上报格式
+
+判定结果复用现有 access log 通道 `POST /api/v1/server/UniProxy/accesslog`（`client.go:308`），
+**不受 access_log 开关约束** —— 运营开 dryrun 就是为了看影响面，不该被迫同时打开全量访问
+日志那个数量级大得多的水管。dryrun 和 enforce 的拒绝都会上报（只报 deny，不报 allow）。
+
+`logs[]` 里的 ACL 记录比普通访问日志多三个字段：
+
+```jsonc
+{
+  "time": 1700000000000,
+  "user_id": 42,
+  "source_ip": "203.0.113.9",
+  "dest_host": "10.9.0.5",       // 域名目标时是域名
+  "dest_port": 443,
+  "network": "tcp",
+  "upload_bytes": 0,             // ACL 记录产生于连接建立时，恒为 0
+  "download_bytes": 0,
+  "duration_ms": 0,
+  "acl_mode": "dryrun",          // dryrun | enforce
+  "acl_action": "deny",
+  "acl_rule": "vip#1"            // 组 id + 规则在下发数组里的下标；兜底为 "default"
+}
+```
+
+- 面板 MUST 按 **`acl_action` 是否存在**来区分两类记录，不要靠 `upload_bytes == 0` 判断。
+- `acl_rule` 的下标是**下发数组里的原始位置**，不是按 priority 排序后的位置，这样运营能在
+  面板上直接定位到那条规则。隐含 DNS 放行规则的 origin 是 `implicit-dns`。
+
+### 7.2 精确总数与采样
+
+`agent` 对象里多了三个字段，**每轮都上报**（包括没有记录的空轮）：
+
+| 字段 | 含义 |
+|---|---|
+| `acl_mode` | 节点当前生效的模式 |
+| `acl_denials` | **精确**累计拒绝数（自内核启动） |
+| `acl_records` | 本轮实际带上来的 ACL 样本条数 |
+
+节点侧的记录缓冲有上限（sing-box 5 万条、xray 2 万条），满了会丢弃并计数，但
+**`acl_denials` 是精确的，永远不被采样**。
+
+> 面板 MUST 用 `acl_denials` 算影响面，用 `logs[]` 里的记录看细节。
+> 若 `acl_records` 的累计增量显著小于 `acl_denials` 的增量，说明缓冲被打满、
+> 细节被截断了 —— 此时按记录条数做的判断会建立在残缺数据上，UI 应当提示。
+
+面板侧要能按「用户 / 组 / 命中规则」聚合，让运营在切 enforce 前看到影响面。
 
 **上线顺序（强制）**：面板先出数据模型与下发（所有节点 `mode: off`，行为无变化）→
 节点侧发版 → 逐节点切 `dryrun` 观察数日 → 再切 `enforce`。
@@ -328,7 +372,10 @@ USR="curl -s -H 'Authorization: Bearer $T' '$P/api/v1/server/UniProxy/user?node_
 | 11 | 二次确认 | 切 `default_action: deny` | 出现确认框 + 审计日志落库 |
 | 12 | WS 推送 | 抓节点日志，改一条 ACL 规则 | 秒级看到 `ws recv event=sync.config` |
 | 13 | mode=off | 节点 `mode: off` 下跑通全量流量 | 无任何拦截，无性能变化 |
-| 14 | dryrun | 切 dryrun，用受限用户访问被禁网段 | 流量**放行**，面板 access log 出现"本应拦截"记录 |
+| 14 | dryrun | 切 dryrun，用受限用户访问被禁网段 | 流量**放行**，accesslog 出现带 `acl_action:"deny"` 的记录 |
+| 14b | 不依赖 access_log | access_log 关闭状态下重跑 #14 | ACL 记录照常上报（见 §7.1） |
+| 14c | 命中规则可定位 | 检查 #14 记录的 `acl_rule` | 形如 `vip#1`，下标对得上你下发数组里的位置 |
+| 14d | 精确总数 | 对比 `agent.acl_denials` 增量与实际拒绝次数 | 一致；缓冲打满时 `acl_records` 才会小于它 |
 | 15 | enforce | 切 enforce，同上 | 流量被拒；同用户访问放行网段正常 |
 | 16 | 组内 AND | 配 `ip_cidrs` + `ports` 同一条 rule | 仅"IP 且 端口"都命中时才生效 |
 | 17 | 优先级 | 配互相冲突的两组，调 priority | 结果与 §3.3 首条命中语义一致 |

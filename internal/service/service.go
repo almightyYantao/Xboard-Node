@@ -1207,8 +1207,9 @@ func (s *Service) pushAccessLogAsync() {
 	}
 	records := s.kernel.DrainAccessLog() // 可能为空：此时仅作为开关/版本轮询
 	logs := make([]map[string]any, 0, len(records))
+	aclRecords := 0
 	for _, r := range records {
-		logs = append(logs, map[string]any{
+		entry := map[string]any{
 			"time":           r.Time,
 			"user_id":        r.UserID,
 			"source_ip":      r.SourceIP,
@@ -1219,12 +1220,26 @@ func (s *Service) pushAccessLogAsync() {
 			"download_bytes": r.Download,
 			"duration_ms":    r.DurationMs,
 			"reason":         r.Reason,
-		})
+		}
+		// ACL 字段只在判定记录上出现，普通访问日志不带 —— 面板据此区分两类记录。
+		if r.IsACL() {
+			entry["acl_mode"] = r.ACLMode
+			entry["acl_action"] = r.ACLAction
+			entry["acl_rule"] = r.ACLRule
+			aclRecords++
+		}
+		logs = append(logs, entry)
 	}
 	agent := map[string]any{
 		"version":            agentVersion,
 		"active_connections": s.tracker.ActiveConnections(),
 		"online_users":       len(s.tracker.CurrentOnline()),
+		// acl_denials 是精确累计值，acl_records 是本轮带上来的样本数。
+		// 缓冲满时后者会小于前者的增量，面板应当用 acl_denials 算影响面，
+		// 用样本记录看细节 —— 否则灰度期的判断会建立在被截断的数据上。
+		"acl_mode":    s.acl.Mode().String(),
+		"acl_denials": s.kernel.ACLDenials(),
+		"acl_records": aclRecords,
 	}
 	go func() {
 		enabled, updateTo, kick, err := pusher.PushAccessLog(logs, agent)

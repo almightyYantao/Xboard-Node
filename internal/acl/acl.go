@@ -86,26 +86,46 @@ type Policy struct {
 // keeps unrestricted users at one pointer each instead of one object each.
 var allowAll = &Policy{def: ActionAllow}
 
+// OriginDefault is the rule origin reported when no rule matched and the
+// policy default decided the outcome.
+const OriginDefault = "default"
+
 // Check evaluates dest against the policy and returns the first matching
 // rule's action, or the policy default when nothing matches.
 //
 // A nil Policy allows everything, so callers can skip a branch on the hot
 // path: acl.Lookup(id).Check(dest) is safe when the user is unrestricted.
 func (p *Policy) Check(dest Dest) Action {
+	action, _ := p.Evaluate(dest)
+	return action
+}
+
+// Evaluate is Check plus the identity of the rule that decided the outcome,
+// for reporting which rule blocked (or would block) a connection.
+func (p *Policy) Evaluate(dest Dest) (Action, string) {
 	if p == nil {
-		return ActionAllow
+		return ActionAllow, OriginDefault
 	}
 	for i := range p.rules {
 		if p.rules[i].matches(dest) {
-			return p.rules[i].action
+			return p.rules[i].action, p.rules[i].origin
 		}
 	}
-	return p.def
+	return p.def, OriginDefault
 }
 
 // DryRun reports whether a denial should be logged rather than enforced.
 func (p *Policy) DryRun() bool {
 	return p != nil && p.dryRun
+}
+
+// ModeLabel names the enforcement mode this policy was compiled for, for use
+// in reported records.
+func (p *Policy) ModeLabel() string {
+	if p.DryRun() {
+		return ModeDryRun.String()
+	}
+	return ModeEnforce.String()
 }
 
 // Restricted reports whether the policy can ever deny anything. Callers use

@@ -15,9 +15,9 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/uuid"
 	xrayCore "github.com/xtls/xray-core/core"
+	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/stats"
-	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	xrayProxy "github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
@@ -33,8 +33,8 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
-	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 const (
@@ -301,8 +301,31 @@ func (x *Xray) UpdateGlobalDevices(_ map[int][]string) {}
 // in the sing-box kernel for now.
 func (x *Xray) SetAccessLogEnabled(_ bool) {}
 
-// DrainAccessLog returns nil for xray (no access-log capture).
-func (x *Xray) DrainAccessLog() []model.AccessRecord { return nil }
+// DrainAccessLog returns buffered ACL verdicts. xray has no general
+// per-connection access logging, but ACL records are emitted independently of
+// that toggle so dry-run reporting works on xray nodes too.
+func (x *Xray) DrainAccessLog() []model.AccessRecord {
+	x.mu.Lock()
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+	if ld == nil {
+		return nil
+	}
+	return ld.DrainACLLog()
+}
+
+// ACLDenials returns the exact number of connections the ACL rejected (or
+// would have rejected, in dry-run) since the current instance started.
+// Records may be sampled when the buffer fills; this count never is.
+func (x *Xray) ACLDenials() uint64 {
+	x.mu.Lock()
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+	if ld == nil {
+		return 0
+	}
+	return ld.ACLDenials()
+}
 
 // ClearGlobalDevices is a no-op for xray.
 func (x *Xray) ClearGlobalDevices() {}
@@ -346,7 +369,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		x.users = merged
 		x.mu.Unlock()
 		x.updateDispatcherLimits(merged)
-	x.updateBandwidthLimits(merged)
+		x.updateBandwidthLimits(merged)
 		return 0, nil
 	}
 

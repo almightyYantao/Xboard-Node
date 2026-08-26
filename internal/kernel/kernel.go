@@ -115,7 +115,16 @@ type Kernel interface {
 	// Default off; zero overhead when disabled. Kernels without support may no-op.
 	SetAccessLogEnabled(enabled bool)
 	// DrainAccessLog returns and clears the buffered access records since last drain.
+	//
+	// The buffer also carries ACL verdict records, which are emitted regardless
+	// of SetAccessLogEnabled: an operator running a dry-run needs the impact
+	// report without turning on the much larger access-log firehose.
 	DrainAccessLog() []model.AccessRecord
+	// ACLDenials returns the exact number of connections the ACL rejected (or
+	// would have rejected, in dry-run) since the kernel started. Drained
+	// records may be sampled when the buffer fills; this counter never is, so
+	// the panel can show true totals alongside sampled detail.
+	ACLDenials() uint64
 }
 
 // ComputeHash returns a hash of config + user identities that would

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	_ "unsafe"
 
 	xrayDispatcher "github.com/xtls/xray-core/app/dispatcher"
@@ -20,6 +21,7 @@ import (
 	"github.com/xtls/xray-core/transport"
 
 	"github.com/cedar2025/xboard-node/internal/acl"
+	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
@@ -91,7 +93,18 @@ type LimitDispatcher struct {
 	aclFunc atomic.Pointer[func(string) *acl.Policy]
 
 	aclDenials atomic.Uint64
+
+	// ACL verdict records awaiting the next panel push. xray has no general
+	// access log, so this buffer exists solely to make dry-run reportable on
+	// xray nodes; without it dry-run would only work under sing-box.
+	aclLogMu      sync.Mutex
+	aclLog        []model.AccessRecord
+	aclLogDropped atomic.Uint64
 }
+
+// aclLogMax bounds the ACL record buffer. The exact denial total is kept
+// separately in aclDenials, so a full buffer costs detail, never accuracy.
+const aclLogMax = 20000
 
 // ipCounter tracks IPs for unlimited users without any lock.
 type ipCounter struct {
@@ -158,7 +171,7 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 
 	// ACL runs before the device-limit check: a destination the user may not
 	// reach should not consume one of their device slots.
-	if err := d.checkACL(email, dest, isTCP); err != nil {
+	if err := d.checkACL(email, sourceIP, dest, isTCP); err != nil {
 		return "", "", false, err
 	}
 
@@ -169,9 +182,9 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 	return email, sourceIP, isTCP, nil
 }
 
-// checkACL evaluates the user's destination policy. It returns a non-nil
-// error only when the connection must be rejected.
-func (d *LimitDispatcher) checkACL(email string, dest net.Destination, isTCP bool) error {
+// checkACL evaluates the user's destination policy and records the verdict.
+// It returns a non-nil error only when the connection must be rejected.
+func (d *LimitDispatcher) checkACL(email, sourceIP string, dest net.Destination, isTCP bool) error {
 	fn := d.aclFunc.Load()
 	if fn == nil {
 		return nil
@@ -188,18 +201,75 @@ func (d *LimitDispatcher) checkACL(email string, dest net.Destination, isTCP boo
 		target.IP = addr.Unmap()
 	}
 
-	if policy.Check(target) == acl.ActionAllow {
+	action, origin := policy.Evaluate(target)
+	if action == acl.ActionAllow {
 		return nil
 	}
 
 	d.aclDenials.Add(1)
+	d.recordACLDenial(email, sourceIP, dest, isTCP, policy, origin)
+
 	if policy.DryRun() {
 		nlog.Core().Info("xray: acl would deny (dryrun)",
-			"email", email, "dest", dest.String())
+			"email", email, "dest", dest.String(), "rule", origin)
 		return nil
 	}
-	nlog.Core().Debug("xray: acl denied", "email", email, "dest", dest.String())
+	nlog.Core().Debug("xray: acl denied", "email", email, "dest", dest.String(), "rule", origin)
 	return errors.New("destination not permitted for " + email)
+}
+
+// recordACLDenial buffers an ACL verdict for the next panel push.
+func (d *LimitDispatcher) recordACLDenial(email, sourceIP string, dest net.Destination,
+	isTCP bool, policy *acl.Policy, origin string) {
+	host := dest.Address.String()
+	if dest.Address.Family().IsDomain() {
+		host = dest.Address.Domain()
+	}
+	network := "udp"
+	if isTCP {
+		network = "tcp"
+	}
+
+	record := model.AccessRecord{
+		Time:      time.Now().UnixMilli(),
+		UserID:    d.uidFor(email),
+		SourceIP:  sourceIP,
+		DestHost:  host,
+		DestPort:  int(dest.Port),
+		Network:   network,
+		ACLMode:   policy.ModeLabel(),
+		ACLAction: acl.ActionDeny.String(),
+		ACLRule:   origin,
+	}
+
+	d.aclLogMu.Lock()
+	if len(d.aclLog) >= aclLogMax {
+		d.aclLogMu.Unlock()
+		if n := d.aclLogDropped.Add(1); n%1000 == 1 {
+			nlog.Core().Warn("xray: acl log buffer full, dropping records", "dropped", n)
+		}
+		return
+	}
+	d.aclLog = append(d.aclLog, record)
+	d.aclLogMu.Unlock()
+}
+
+// uidFor resolves a stats email to the panel user ID. Only called on the
+// denial path, so taking the lock here costs nothing on normal traffic.
+func (d *LimitDispatcher) uidFor(email string) int {
+	d.mu.RLock()
+	uid := d.emailToUID[email]
+	d.mu.RUnlock()
+	return uid
+}
+
+// DrainACLLog returns and clears the buffered ACL verdicts.
+func (d *LimitDispatcher) DrainACLLog() []model.AccessRecord {
+	d.aclLogMu.Lock()
+	out := d.aclLog
+	d.aclLog = nil
+	d.aclLogMu.Unlock()
+	return out
 }
 
 // SetACLFunc installs the policy resolver. Passing nil disables ACL checks.

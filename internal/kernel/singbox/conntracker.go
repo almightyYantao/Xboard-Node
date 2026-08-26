@@ -128,6 +128,7 @@ func (u *userStats) aliveIPList() map[string]bool {
 //   - Hooking into sing's ReadCounter/WriteCounter for zero-copy byte counting
 //   - Close callback to decrement IP refcounts
 //   - Per-connection rate limit token accumulation (amortized WaitN)
+//
 // connRef holds a closable connection plus the user it belongs to, so the
 // tracker can force-close either a single connection (by ID) or every
 // connection of a user (by UUID). Both net.Conn and N.PacketConn satisfy
@@ -298,12 +299,13 @@ func (t *ConnTracker) SetACLFunc(fn func(uuid string) *acl.Policy) {
 // have rejected, in dry-run) since this tracker was created.
 func (t *ConnTracker) ACLDenials() uint64 { return t.aclDenials.Load() }
 
-// aclRejects reports whether the user's policy forbids this destination.
+// aclRejects reports whether the user's policy forbids this destination, and
+// records the denial for the panel either way.
 //
 // sing-box calls the tracker after routing has picked an outbound, so the
 // only way to refuse is to close the connection. That is the same mechanism
 // the device-limit gate already uses.
-func (t *ConnTracker) aclRejects(uuid string, metadata adapter.InboundContext, udp bool) bool {
+func (t *ConnTracker) aclRejects(uuid string, userID int, sourceIP string, metadata adapter.InboundContext, udp bool) bool {
 	fn := t.aclFunc.Load()
 	if fn == nil {
 		return false
@@ -320,19 +322,46 @@ func (t *ConnTracker) aclRejects(uuid string, metadata adapter.InboundContext, u
 		dest.IP = addr.Unmap()
 	}
 
-	if policy.Check(dest) == acl.ActionAllow {
+	action, origin := policy.Evaluate(dest)
+	if action == acl.ActionAllow {
 		return false
 	}
 
 	t.aclDenials.Add(1)
+	t.recordACLDenial(userID, sourceIP, metadata, udp, policy, origin)
+
 	if policy.DryRun() {
 		nlog.Core().Info("singbox: acl would deny (dryrun)",
-			"user", uuid, "dest", metadata.Destination.String())
+			"user", uuid, "dest", metadata.Destination.String(), "rule", origin)
 		return false
 	}
 	nlog.Core().Debug("singbox: acl denied",
-		"user", uuid, "dest", metadata.Destination.String())
+		"user", uuid, "dest", metadata.Destination.String(), "rule", origin)
 	return true
+}
+
+// recordACLDenial buffers an ACL verdict for the next panel push.
+//
+// Deliberately not gated on accessEnabled: an operator running dry-run needs
+// the impact report without also turning on full access logging.
+func (t *ConnTracker) recordACLDenial(userID int, sourceIP string, metadata adapter.InboundContext,
+	udp bool, policy *acl.Policy, origin string) {
+	host, port := destFromMeta(metadata)
+	network := "tcp"
+	if udp {
+		network = "udp"
+	}
+	t.recordAccess(model.AccessRecord{
+		Time:      time.Now().UnixMilli(),
+		UserID:    userID,
+		SourceIP:  sourceIP,
+		DestHost:  host,
+		DestPort:  port,
+		Network:   network,
+		ACLMode:   policy.ModeLabel(),
+		ACLAction: acl.ActionDeny.String(),
+		ACLRule:   origin,
+	})
 }
 
 // SetUserMap replaces the UUID→userID mapping and ensures per-user stats
@@ -392,7 +421,7 @@ func (t *ConnTracker) RoutedConnection(
 	t.usersMu.RUnlock()
 
 	// ACL first: a forbidden destination should not burn a device slot.
-	if t.aclRejects(uuid, metadata, false) {
+	if t.aclRejects(uuid, uid, sourceIP, metadata, false) {
 		conn.Close()
 		return conn
 	}
@@ -461,7 +490,7 @@ func (t *ConnTracker) RoutedPacketConnection(
 	t.usersMu.RUnlock()
 
 	// ACL first: a forbidden destination should not burn a device slot.
-	if t.aclRejects(uuid, metadata, true) {
+	if t.aclRejects(uuid, uid, sourceIP, metadata, true) {
 		conn.Close()
 		return conn
 	}

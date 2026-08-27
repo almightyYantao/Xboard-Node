@@ -329,8 +329,17 @@ check(user, dest_ip, dest_domain, port, proto):
 
 ## 8. 安全护栏（面板 MUST 实现）
 
-`default_action: deny` 会把节点变成"默认不通"。一旦策略不到位就是全员断网，**且运营
-无法通过面板自救**（用户连不上，管理员自己也连不上）。因此：
+`default_action: deny` 会把节点变成"默认不通"。一旦策略不到位就是**全体终端用户断网**。
+
+> **控制通道不受影响。** ACL 只对已认证的代理用户生效（xray 判 `si.User.Email`、
+> sing-box 判 `metadata.User`），而 agent 与面板之间用的是自己的 `http.Client`
+> 直连，从不流经内核。所以锁死之后面板照样能推配置、能把 `mode` 改回 `off`，
+> 健康检查端口和 ACME 签发也都正常。
+>
+> 唯一的自锁场景是**管理员自己经由该节点访问面板**（面板在内网、靠这条代理进去）——
+> 此时切断用户流量会同时切断你进面板的路。属于部署拓扑问题，运维需自行确认是否成立。
+
+因此：
 
 1. 切换节点为 `default_action: deny` MUST 二次确认，并记审计日志（操作人、时间、前后值）。
 2. `default_action: deny` 且该节点关联的所有组都没有任何 `allow` 规则 → MUST 阻止保存

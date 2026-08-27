@@ -6,6 +6,13 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main, master]
+  # 手动触发。发版本来只挂在"推 tag"这个一次性事件上，2026-08-26 那次
+  # Actions 故障里事件被压了 70 分钟才出队 —— 当时若真被丢弃，唯一的补救
+  # 手段就是删 tag 重推。有了这个入口就能对着已有的 tag 直接重跑。
+  #
+  # 注意：workflow_dispatch 读的是目标 ref 上的 workflow 文件，所以只对
+  # 本次改动之后打的 tag 生效。对着旧 tag 跑需要用 API 指定 ref。
+  workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true

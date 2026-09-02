@@ -611,7 +611,7 @@ func TestBuildConfig_AllProtocols_ValidJSON(t *testing.T) {
 // --- Routes ---
 
 func TestBuildRoutes_Default(t *testing.T) {
-	route := buildRoutes(nil, nil, nil, nil)
+	route := buildRoutes(nil, nil, nil, nil, nil)
 	assertMapValue(t, route, "final", "direct")
 
 	rules := route["rules"].([]M)
@@ -628,7 +628,7 @@ func TestBuildRoutes_WithCustomRules(t *testing.T) {
 		{ID: 2, Match: []string{"10.0.0.0/8"}, Action: "block"},
 		{ID: 3, Match: []string{"allowed.com"}, Action: "direct"},
 	}
-	route := buildRoutes(testRouteRules(rules), nil, nil, nil)
+	route := buildRoutes(testRouteRules(rules), nil, nil, nil, nil)
 	allRules := route["rules"].([]M)
 
 	if len(allRules) != 5 {
@@ -653,7 +653,7 @@ func TestBuildRoutes_MultiMatch(t *testing.T) {
 		{ID: 1, Match: []string{"*.evil.com", "bad.org", "192.168.1.0/24"}, Action: "block"},
 		{ID: 2, Match: []string{"*.bypass.com"}, Action: "direct"},
 	}
-	route := buildRoutes(testRouteRules(rules), nil, nil, nil)
+	route := buildRoutes(testRouteRules(rules), nil, nil, nil, nil)
 	allRules := route["rules"].([]M)
 
 	// 2 default private-IP rules + 1 domain rule + 1 CIDR rule + 1 domain rule = 5
@@ -699,7 +699,7 @@ func TestBuildRoutes_WithCustomRouteRules(t *testing.T) {
 			Action: model.RouteAction{Type: "direct"},
 		},
 	}
-	route := buildRoutes(nil, customRules, nil, nil)
+	route := buildRoutes(nil, customRules, nil, nil, nil)
 	allRules := route["rules"].([]M)
 	if len(allRules) != 9 {
 		t.Fatalf("rules count: got %d, want 9", len(allRules))
@@ -733,7 +733,7 @@ func TestBuildRoutes_StructuredCustomRulesRemainFirst(t *testing.T) {
 		Match:  model.RouteMatch{DomainSuffixes: []string{"structured.example"}},
 		Action: model.RouteAction{Type: "direct"},
 	}}
-	route := buildRoutes(nil, custom, raw, nil)
+	route := buildRoutes(nil, custom, raw, nil, nil)
 	allRules := route["rules"].([]M)
 	if allRules[0]["outbound"] != "direct" {
 		t.Fatalf("expected structured route first, got %v", allRules[0]["outbound"])
@@ -893,7 +893,7 @@ func TestExtractECHInbound(t *testing.T) {
 // block made it impossible, and panel route rules could not undo it because they
 // are appended *after* the block.
 func TestPrivateAllowPrecedesTheBlock(t *testing.T) {
-	route := buildRoutes(nil, nil, nil, []string{"10.0.0.208/32", "192.168.7.0/24"})
+	route := buildRoutes(nil, nil, nil, []string{"10.0.0.208/32", "192.168.7.0/24"}, nil)
 	rules, _ := route["rules"].([]M)
 
 	allowAt, blockAt := -1, -1
@@ -940,7 +940,7 @@ func TestPrivateAllowRefusesMetadataAndLoopback(t *testing.T) {
 
 // No allowlist configured = previous behaviour, every private range blocked.
 func TestNoAllowlistKeepsEverythingBlocked(t *testing.T) {
-	route := buildRoutes(nil, nil, nil, nil)
+	route := buildRoutes(nil, nil, nil, nil, nil)
 	rules, _ := route["rules"].([]M)
 	for _, rule := range rules {
 		if rule["outbound"] == "direct" {

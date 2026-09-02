@@ -65,13 +65,22 @@ func (m Mode) String() string {
 //
 // Exactly one of IP / Domain is meaningful: proxy protocols carry either a
 // resolved address or the hostname the client asked for. The ACL never
-// resolves a domain to match an IP rule — a DNS round trip per connection
-// would cost five orders of magnitude more than the match itself.
+// resolves a domain itself to match an IP rule — a DNS round trip per
+// connection would cost five orders of magnitude more than the match itself.
 type Dest struct {
 	IP     netip.Addr // invalid when the client addressed a domain
 	Domain string     // empty when the client addressed an IP
 	Port   uint16
 	UDP    bool
+
+	// ResolvedIPs are the addresses the kernel already resolved Domain to,
+	// carried here only when something upstream did the lookup for free —
+	// sing-box's `resolve` route action fills InboundContext.DestinationAddresses
+	// while leaving Destination as the FQDN. It lets an ip_cidr rule govern
+	// domain-addressed traffic without the ACL paying for DNS, and because the
+	// node resolved it, a client cannot forge the answer. Empty is the normal
+	// case and costs nothing.
+	ResolvedIPs []netip.Addr
 }
 
 // Policy is a compiled, immutable rule list for one group-combination.
@@ -102,10 +111,49 @@ func (p *Policy) Check(dest Dest) Action {
 
 // Evaluate is Check plus the identity of the rule that decided the outcome,
 // for reporting which rule blocked (or would block) a connection.
+//
+// A domain target is judged by the domain rules first: an operator naming a
+// domain has stated their intent about it, so that verdict wins either way.
+// Only when no rule matched the name at all do ResolvedIPs get a turn, which
+// is what lets an ip_cidr allowlist govern domain-addressed traffic.
+//
+// Aggregating several candidate addresses is deliberately asymmetric: the
+// kernel may dial any of them, possibly failing over, so one denied address
+// denies the connection. "Any deny wins" is the only direction that holds for
+// both rule flavours — an allowlist cannot be slipped past with a DNS answer
+// mixing one permitted address in with forbidden ones, and a blocklist still
+// catches a forbidden address hiding behind others.
 func (p *Policy) Evaluate(dest Dest) (Action, string) {
 	if p == nil {
 		return ActionAllow, OriginDefault
 	}
+	action, origin := p.match(dest)
+	if origin != OriginDefault || dest.Domain == "" || len(dest.ResolvedIPs) == 0 {
+		return action, origin
+	}
+
+	// The name matched nothing. Fall back to the addresses the kernel resolved
+	// it to, which is the node's own DNS view of the target.
+	probe := dest
+	probe.Domain = ""
+	probe.ResolvedIPs = nil
+	fallback := OriginDefault
+	for _, ip := range dest.ResolvedIPs {
+		probe.IP = ip.Unmap()
+		a, o := p.match(probe)
+		if a == ActionDeny {
+			return ActionDeny, o
+		}
+		if fallback == OriginDefault {
+			fallback = o
+		}
+	}
+	return ActionAllow, fallback
+}
+
+// match runs the rule list once, returning the first matching rule's action or
+// the policy default when nothing matches.
+func (p *Policy) match(dest Dest) (Action, string) {
 	for i := range p.rules {
 		if p.rules[i].matches(dest) {
 			return p.rules[i].action, p.rules[i].origin

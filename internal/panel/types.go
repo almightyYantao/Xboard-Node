@@ -115,6 +115,18 @@ type NodeConfig struct {
 	// Empty (or absent) keeps the old behaviour: all private ranges blocked.
 	PrivateAllowCIDRs []string `json:"private_allow_cidrs,omitempty"`
 
+	// ACLResolveDomains lists domain suffixes the node resolves at route time
+	// so that ACL ip_cidr rules can govern them. Clients address internal
+	// services by hostname, and a hostname can never match an ip_cidr rule, so
+	// without this an "allow 10.0.0.0/8" policy blocks exactly the traffic it
+	// was written to permit.
+	//
+	// It lives here rather than inside ACLConfig on purpose: it is compiled
+	// into the kernel's route rules, so it must be part of the kernel hash,
+	// whereas ACLConfig must stay out of it (see NodeSpec.ACL). Editing this
+	// list rebuilds the kernel; editing groups and rules still does not.
+	ACLResolveDomains []string `json:"acl_resolve_domains,omitempty"`
+
 	// Certificate settings (Xboard extension)
 	CertConfig *CertConfig `json:"cert_config,omitempty"`
 	AutoTLS    bool        `json:"auto_tls,omitempty"` // Deprecated: use CertConfig

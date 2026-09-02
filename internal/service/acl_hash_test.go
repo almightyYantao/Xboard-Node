@@ -41,6 +41,27 @@ func TestKernelHashIgnoresACL(t *testing.T) {
 	}
 }
 
+// acl_resolve_domains is the deliberate exception, and the reason it is not a
+// field inside ACLConfig: it compiles into a kernel route rule, so the kernel
+// must be rebuilt when it changes. Pinning both halves here keeps the split
+// honest — someone moving this field under `acl` to tidy the contract would
+// make it silently take effect only at the next unrelated kernel rebuild.
+func TestKernelHashTracksACLResolveDomains(t *testing.T) {
+	users := []model.UserSpec{{ID: 1, UUID: "u-1"}}
+
+	withDomains := baseSpec()
+	withDomains.ACLResolveDomains = []string{"internal.example.com"}
+	if kernel.ComputeHash(baseSpec(), users) == kernel.ComputeHash(withDomains, users) {
+		t.Error("adding acl_resolve_domains must change the kernel hash")
+	}
+
+	changed := baseSpec()
+	changed.ACLResolveDomains = []string{"other.example.com"}
+	if kernel.ComputeHash(withDomains, users) == kernel.ComputeHash(changed, users) {
+		t.Error("editing acl_resolve_domains must change the kernel hash")
+	}
+}
+
 // Group membership must not restart the kernel either — it rides on the user
 // records, which the kernel hashes by ID and UUID only.
 func TestKernelHashIgnoresUserACLGroups(t *testing.T) {

@@ -59,7 +59,7 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	}
 
 	// Merge panel routes and static config routes
-	cfg["route"] = buildRoutes(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute), nc.PrivateAllowCIDRs)
+	cfg["route"] = buildRoutes(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute), nc.PrivateAllowCIDRs, nc.ACLResolveDomains)
 
 	// Automatically enable rule_set caching (cache_file) when panel routes
 	// reference geoip:/geosite: entries so that the downloaded .srs rule_set
@@ -144,8 +144,29 @@ func mergeRouteList(a, b []map[string]any) []map[string]any {
 	return res
 }
 
-func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteRule, custom []map[string]any, privateAllow []string) M {
+func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteRule, custom []map[string]any, privateAllow []string, aclResolveDomains []string) M {
 	var rules []M
+
+	// Resolution for ACL first: `resolve` is a non-terminal action, so it must
+	// run before anything that can select an outbound, and everything after it
+	// then matches on the resolved addresses instead of missing on the FQDN.
+	//
+	// This is what lets an ACL ip_cidr rule govern a domain-addressed
+	// connection: sing-box fills InboundContext.DestinationAddresses and leaves
+	// Destination as the hostname, and the ACL hook reads both.
+	//
+	// Note the side effect, which is deliberate: the private-range block below
+	// starts applying to these domains too. Before resolution a hostname could
+	// not match ip_cidr, so such traffic fell through to `final: direct` and
+	// bypassed the SSRF guard entirely. Operators must therefore have the
+	// segment in private_allow — docs-user-acl.md §3.5 spells this out.
+	if len(aclResolveDomains) > 0 {
+		rules = append(rules, M{
+			"domain_suffix": aclResolveDomains,
+			"action":        "resolve",
+			"strategy":      "prefer_ipv4",
+		})
+	}
 
 	// Structured custom routes now take the highest priority for panel-managed overrides.
 	for _, rule := range customRules {

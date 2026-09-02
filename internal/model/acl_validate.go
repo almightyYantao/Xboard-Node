@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -206,6 +207,50 @@ func validateACLDomain(entry string) error {
 		return fmt.Errorf("invalid domain %q (no leading or trailing dot)", entry)
 	}
 	return nil
+}
+
+// normalizeResolveDomains cleans a pushed ACLResolveDomains list.
+//
+// Entries are lowercased, deduplicated and sorted. Sorting is not cosmetic:
+// this list is part of the kernel hash, so a panel that returns the same
+// domains in a different order would otherwise rebuild the kernel and drop
+// every connection on the node for no reason.
+//
+// Operators copy these lists out of client configs, so the leading "+." and
+// "*." wildcard markers of Clash-style syntax and a bare leading dot are all
+// accepted and stripped — sing-box's domain_suffix wants the bare name, and
+// silently not matching would be worse than being lenient here. Entries that
+// are still not usable as a domain are dropped rather than failing the whole
+// push: this field only ever widens what an ip_cidr rule can see, so a bad
+// entry costs matching, never safety.
+func normalizeResolveDomains(raw []string) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, entry := range raw {
+		name := strings.ToLower(strings.TrimSpace(entry))
+		name = strings.TrimPrefix(name, "+.")
+		name = strings.TrimPrefix(name, "*.")
+		name = strings.Trim(name, ".")
+		if name == "" {
+			continue
+		}
+		if validateACLDomain(name) != nil || !strings.Contains(name, ".") {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	return out
 }
 
 func validateACLPorts(values []string, path string) error {

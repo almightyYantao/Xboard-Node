@@ -113,9 +113,19 @@ node.acl_default_action  enum(allow,deny)         default 'allow'
 }
 ```
 
+同一个 NodeConfig 上还有一个**与 `acl` 平级**的字段，见 §3.5 —— 它必须放在 `acl` 外面：
+
+```jsonc
+{
+  "acl": { /* ... */ },
+  "acl_resolve_domains": ["qunhequnhe.com"]   // 与 acl 平级，不在 acl 里面
+}
+```
+
 | 字段 | 类型 | 必填 | 默认 | 约束 |
 |------|------|------|------|------|
 | `acl` | object | 否 | **缺失 = ACL 完全禁用** | 见 §3.4 |
+| `acl_resolve_domains` | string[] | 否 | `[]` | 域名后缀，**与 `acl` 平级**，见 §3.5 |
 | `acl.mode` | string | 是 | — | `off` / `dryrun` / `enforce` |
 | `acl.default_action` | string | 是 | — | `allow` / `deny` |
 | `acl.implicit_dns_allow` | bool | 否 | `true` | 见 §8 |
@@ -177,18 +187,42 @@ policy_of(user):
         rules += sort(g.rules, by priority asc, then array index asc)
     return rules, first_non_null([g.default_action for g in groups]) ?? acl.default_action
 
-check(user, dest_ip, dest_domain, port, proto):
-    for r in policy_of(user).rules:
-        if matches(r, ...): return r.action        # 第一条命中即决定
-    return policy_of(user).default_action
+match_once(policy, dest_ip, dest_domain, port, proto):
+    for r in policy.rules:
+        if matches(r, ...): return r.action, r.origin   # 第一条命中即决定
+    return policy.default_action, "default"
+
+check(user, dest_ip, dest_domain, port, proto, resolved_ips):
+    p = policy_of(user)
+    action, origin = match_once(p, dest_ip, dest_domain, port, proto)
+    if origin != "default" or dest_domain is null or resolved_ips is empty:
+        return action, origin
+    # 域名没命中任何规则，改用内核已解析出的地址再判
+    for addr in resolved_ips:                            # 任一 deny 即 deny
+        a, o = match_once(p, addr, null, port, proto)
+        if a == deny: return deny, o
+    return allow, first_explicit_origin_seen ?? "default"
 ```
 
 要点：
 - **首条命中即返回**，不做"deny 优先"之类的隐式覆盖。顺序完全由 priority 决定。
 - 组级 `default_action` 取**优先级最高的那个非 null 组**的值；都为 null 则用节点级。
-- 目标是域名时只走域名维度，是 IP 时只走 IP 维度。**节点不会为了匹配 IP 规则去解析域名**
-  —— 每连接一次 DNS 会比 ~30 ns 的匹配贵五个数量级。因此需要按域名放行的场景，
-  面板 UI MUST 引导运营同时配 `domain_suffixes`，不能只配 `ip_cidrs`。
+- 目标是域名时先只走域名维度。**节点自己不会为了匹配 IP 规则去解析域名** —— 每连接
+  一次 DNS 会比 ~35 ns 的匹配贵五个数量级。
+- 但如果内核在路由阶段**已经**解析过（sing-box 的 `resolve` route action 会填
+  `DestinationAddresses` 而不改写 `Destination`），且域名维度**没有命中任何规则**，
+  节点会拿这些地址再判一轮，于是 `ip_cidrs` 也能管住域名寻址的流量。这是节点侧
+  配置项，面板无需下发任何新字段。
+- 命名了域名的规则**优先于**解析地址：运营写了域名就是表达了对这个名字的意图，
+  allow/deny 两个方向都按它决定，解析地址不再参与。
+- 多个解析地址的聚合是**故意不对称的：任一地址被拒则整条连接被拒**。内核可能拨任意
+  一个地址、还可能故障转移，所以"至少有一个被放行就放行"会让白名单被一个混合
+  DNS 应答绕过；同样，黑名单也不能让一个被禁地址躲在允许地址后面。
+- 域名寻址 + 只配 `ip_cidrs` + 节点未开 `resolve`，结果仍然是落到 default。面板 UI
+  MUST 在这种组合下引导运营补 `domain_suffixes`，或提示节点侧启用 `resolve`。
+- **xray 节点不支持解析回退**：ACL 钩子在 `Dispatch` 里，比路由更早，拿不到任何已解析
+  地址。xray 上只能配 `domain_suffixes`。面板模拟器若要区分内核，需要按节点类型给出
+  不同预览。
 
 ### 3.4 缺失 vs 空 —— 最关键的一组语义
 
@@ -203,6 +237,80 @@ check(user, dest_ip, dest_domain, port, proto):
 面板 MUST NOT 用 `acl: null`、`acl: []`、`acl: {}` 表达"关闭" —— 关闭请用
 `mode: "off"` 或整个字段不下发。节点对 `acl` 存在但缺 `mode`/`default_action` 的情况
 按解析失败处理：保留上一次生效策略并告警。
+
+### 3.5 `acl_resolve_domains` —— 让 `ip_cidrs` 管住域名寻址的流量
+
+客户端交给节点的目标通常是**域名**（vless/vmess 协议头里就是主机名；客户端本地那套
+fake-ip / `nameserver-policy` 只影响客户端自己的选路）。域名目标匹配不上 `ip_cidrs`，
+所以"只放行某个内网段"的策略在 default deny 下会把这类流量全拦掉 —— 恰好是它本来
+想放行的那部分。
+
+面板下发要让节点解析的域名后缀即可：
+
+```jsonc
+{
+  "acl": { "mode": "enforce", "default_action": "deny", "groups": [ /* ... */ ] },
+  "acl_resolve_domains": ["qunhequnhe.com", "corp.example.com"]
+}
+```
+
+节点把它编成一条 sing-box 的 `resolve` 路由规则，放在规则链最前。于是内核在路由阶段
+就解析出地址，ACL 判定时先按域名匹配，域名一条规则都没命中时改用这些地址再判一轮
+（算法见 §3.3）。
+
+| 字段 | 类型 | 必填 | 默认 | 约束 |
+|---|---|---|---|---|
+| `acl_resolve_domains` | string[] | 否 | `[]` | 域名**后缀**（`qunhequnhe.com` 覆盖 `kaptain.qunhequnhe.com`） |
+
+节点侧会归一化：小写、去空白、剥掉 `+.` / `*.` / 前导点（这些是客户端配置语法，运营常
+直接复制过来）、去重、**排序**。不合法的条目被丢弃而不是让整次推送失败 —— 这个字段只
+会放宽 `ip_cidrs` 能看到的范围，一条脏数据的代价是匹配不到，不是安全问题。
+
+#### 为什么它必须放在 `acl` 外面
+
+这是**故意的**，不是漏放。`acl` 带 `json:"-"`，刻意不进内核 hash（见 §5 与 `NodeSpec.ACL`
+的注释），这样改策略才不会重启 xray、断掉全节点连接。而 `acl_resolve_domains` 会编成
+内核路由规则，**必须**进 hash、必须触发内核重建才能生效。
+
+两者的运维语义因此不同，面板 UI 应当分开表达：
+
+| 改动 | 后果 |
+|---|---|
+| 改 `acl.groups` / `rules` / 用户组成员 | 进程内原子换快照，**不断连**，秒级生效 |
+| 改 `acl_resolve_domains` | **重建内核**（xray 是全量重启，会断连），改动频率应当很低 |
+
+把它挪进 `acl` 去"让契约更整齐"会导致改这个字段只在下一次不相关的内核重建时才生效 ——
+一个极难排查的静默故障。节点侧有测试钉住这条不变量（`TestKernelHashTracksACLResolveDomains`
+与 `TestKernelHashIgnoresACL`）。
+
+#### 上线前必须确认的三件事
+
+- **`private_allow_cidrs` 要先配齐。** `resolve` 是非终止 action（sing-box
+  `route/route.go:585`），匹配继续往下走，于是路由层的内网黑名单（`10.0.0.0/8` 等）
+  **开始对这些域名生效**了 —— 在此之前域名匹配不上 `ip_cidr`，这类流量是直接落到
+  `final: direct` 溜过去的。段没在 `private_allow_cidrs` 里，原本能用的域名访问会在
+  **路由层**被 block，而且**不产生任何 ACL 日志**（ACL 根本没被问到），排查方向会完全跑偏。
+  这一条本质是收紧 SSRF 防护，方向对，但顺序不能错。
+- **节点必须能解析这些域名。** 生成的 sing-box 配置默认没有 `dns` 块，`resolve` 走系统
+  解析器。解析失败是连接直接失败，比"被 ACL 拦掉"更难查。节点的 `/etc/resolv.conf`
+  指不到内网 DNS 时，要用节点侧 `kernel.custom_config` 补一个 `dns` 块（该字段是整体替换）。
+- **只列真正需要的后缀。** 每个后缀给首次连接加一次 DNS（有内核 DNS 缓存兜底）。不要
+  为了省事下发一个覆盖一切的后缀。
+
+#### 与 `domain_suffixes` 的取舍
+
+在 ACL 规则里直接写 `domain_suffixes` 也能放行，且不需要内核重建。区别在于安全语义：
+
+- `acl_resolve_domains` + `ip_cidrs`：解析由**节点自己的 DNS** 完成，客户端伪造不了，
+  "只放行 10.0.0.0/8"这句话仍然成立；域名哪天指向公网就自然被拒。
+- `domain_suffixes`：放行的是这个域名解析到的**任何**地址，包括哪天它指向公网。面板上
+  显示的"只放行内网段"与实际生效的语义已经不一致。
+
+#### xray 不支持
+
+xray 的 ACL 钩子在 `Dispatch` 里，比路由更早，session 里没有任何已解析地址。xray 节点
+上这个字段无效，节点启动时会打一条 Warn 明说这件事（而不是静默无效），只能改用
+`domain_suffixes`。面板若同时管两种内核，UI 应当按节点内核类型给出不同提示。
 
 ---
 
@@ -388,9 +496,16 @@ USR="curl -s -H 'Authorization: Bearer $T' '$P/api/v1/server/UniProxy/user?node_
 | 15 | enforce | 切 enforce，同上 | 流量被拒；同用户访问放行网段正常 |
 | 16 | 组内 AND | 配 `ip_cidrs` + `ports` 同一条 rule | 仅"IP 且 端口"都命中时才生效 |
 | 17 | 优先级 | 配互相冲突的两组，调 priority | 结果与 §3.3 首条命中语义一致 |
-| 18 | 模拟器一致性 | 对 #16 #17 的用例跑面板模拟器 | 输出与节点实际行为逐条一致 |
+| 17b | 域名寻址落 default | 只配 `ip_cidrs` 的 allow 规则、`acl_resolve_domains` 为空，用受限用户按**域名**访问该网段 | 判定为 deny，`acl_rule` 是 `default` 或那条兜底 deny —— 这是预期行为，不是 bug（见 §3.5） |
+| 17c | 解析回退生效 | 下发 `acl_resolve_domains: ["<该后缀>"]` 后重跑 #17b | 放行，`acl_rule` 指向那条 `ip_cidrs` 规则 |
+| 17d | 混合应答不放过 | 让该域名解析出一个段内 + 一个段外地址 | 判定为 deny（任一地址被拒即拒，见 §3.3） |
+| 17e | 字段位置正确 | 取 config | `acl_resolve_domains` 与 `acl` **平级**，不在 `acl` 对象里面（见 §3.5） |
+| 17f | xray 明确告警 | 给 xray 节点下发 `acl_resolve_domains` | 节点日志出现 `acl_resolve_domains is not supported on this kernel` 的 Warn，而不是静默无效 |
+| 18 | 模拟器一致性 | 对 #16 #17 #17b–d 的用例跑面板模拟器 | 输出与节点实际行为逐条一致；模拟器需按内核类型区分是否有解析回退 |
 | 19 | 生效时延 | 改组成员后计时 | WS 通道秒级；仅 ETag 时不超过一个 `pull_interval` |
 | 20 | 不断连 | enforce 下改组成员 | 其他用户已建立的连接不受影响 |
+| 20b | ACL 改动不重建内核 | 改 `acl` 里任意字段（mode / default_action / 规则 / 组），抓节点日志 | xray 出现 `kernel configuration unchanged`、**没有** `performing full restart`；sing-box 不重建 inbound。连接数不掉 |
+| 20c | 解析域名改动会重建 | 改 `acl_resolve_domains` | 与 20b 相反：内核重建（xray 全量重启）。这是预期代价，面板 UI MUST 在这个字段上提示，见 §3.5 |
 
 ---
 

@@ -80,6 +80,17 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	// Merge panel routes and static config routes
 	cfg["routing"] = buildRouting(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
 
+	// The ACL's resolution fallback has no xray equivalent: the ACL hook lives
+	// in the dispatcher, which runs before routing, and xray carries no
+	// resolved addresses in the session at that point. Saying so is the point —
+	// the alternative is an operator configuring this on the panel, seeing
+	// nothing change, and concluding the ACL itself is broken.
+	if len(nc.ACLResolveDomains) > 0 {
+		nlog.Core().Warn("xray: acl_resolve_domains is not supported on this kernel; "+
+			"domain-addressed traffic cannot match ip_cidr rules here — use domain_suffixes in the ACL rules instead",
+			"domains", len(nc.ACLResolveDomains))
+	}
+
 	mergeCustomXray(cfg, kcfg)
 	return cfg
 }

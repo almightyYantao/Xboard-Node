@@ -16,6 +16,12 @@ type NodeSpec struct {
 	CustomRoutes      []map[string]any
 	CustomRouteRules  []CustomRouteRule
 	PrivateAllowCIDRs []string
+
+	// ACLResolveDomains are domain suffixes the kernel resolves at route time
+	// so ACL ip_cidr rules apply to them. Unlike ACL itself this belongs in the
+	// kernel hash — it becomes a route rule — which is why the panel sends it
+	// outside the acl object. See panel.NodeConfig.ACLResolveDomains.
+	ACLResolveDomains []string
 	CertConfig        *config.CertConfig
 	AutoTLS           bool
 	Domain            string

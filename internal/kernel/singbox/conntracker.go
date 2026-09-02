@@ -318,6 +318,12 @@ func (t *ConnTracker) aclRejects(uuid string, userID int, sourceIP string, metad
 	dest := acl.Dest{Port: metadata.Destination.Port, UDP: udp}
 	if fqdn := metadata.Destination.Fqdn; fqdn != "" {
 		dest.Domain = strings.ToLower(fqdn)
+		// A `resolve` route action does not rewrite Destination — it only fills
+		// DestinationAddresses (sing-box route.actionResolve) — so this is the
+		// one place the node's own resolution of the name is visible. Without
+		// it an ip_cidr rule can never govern domain-addressed traffic, which
+		// is most of it: clients hand us the hostname, not an address.
+		dest.ResolvedIPs = metadata.DestinationAddresses
 	} else if addr := metadata.Destination.Addr; addr.IsValid() {
 		dest.IP = addr.Unmap()
 	}

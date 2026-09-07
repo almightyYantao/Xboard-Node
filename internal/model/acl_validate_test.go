@@ -143,3 +143,28 @@ func TestACLDNSAllowedDefaultsTrue(t *testing.T) {
 		t.Error("explicit false must be honoured")
 	}
 }
+
+// match_resolved only extends ip_cidrs, so on a rule without any it is a
+// silently ineffective flag. Refuse it for the same reason a rule with no
+// matcher at all is refused.
+func TestValidateACLConfigRejectsMatchResolvedWithoutCIDRs(t *testing.T) {
+	cfg := allowRule(ACLRule{
+		Action:         "allow",
+		DomainSuffixes: []string{"corp.example.com"},
+		MatchResolved:  true,
+	})
+	if err := ValidateACLConfig(cfg); err == nil {
+		t.Error("match_resolved without ip_cidrs must be rejected")
+	}
+}
+
+func TestValidateACLConfigAcceptsMatchResolvedWithCIDRs(t *testing.T) {
+	cfg := allowRule(ACLRule{
+		Action:        "allow",
+		IPCIDRs:       []string{"10.0.0.1/32"},
+		MatchResolved: true,
+	})
+	if err := ValidateACLConfig(cfg); err != nil {
+		t.Errorf("valid match_resolved rule rejected: %v", err)
+	}
+}

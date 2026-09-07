@@ -45,7 +45,8 @@ func TestConfigACLDecodes(t *testing.T) {
 					"ip_cidrs": ["10.1.0.0/16"],
 					"domain_suffixes": ["corp.example.com"],
 					"ports": ["443", "8000-9000"],
-					"protocols": ["tcp"]
+					"protocols": ["tcp"],
+					"match_resolved": true
 				}]
 			}]
 		}
@@ -76,6 +77,9 @@ func TestConfigACLDecodes(t *testing.T) {
 	}
 	if len(r.DomainSuffixes) != 1 || r.DomainSuffixes[0] != "corp.example.com" {
 		t.Errorf("domain_suffixes = %v", r.DomainSuffixes)
+	}
+	if !r.MatchResolved {
+		t.Error("match_resolved must decode")
 	}
 	if len(r.Ports) != 2 || r.Ports[1] != "8000-9000" {
 		t.Errorf("ports = %v", r.Ports)

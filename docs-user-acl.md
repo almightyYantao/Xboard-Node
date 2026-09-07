@@ -20,6 +20,7 @@
 | 6 | 校验 | 保存时校验，不得把非法数据推给节点 | §4 |
 | 7 | 后台 UI | 组管理、用户组关联、节点开关、default deny 二次确认 | §8 |
 | 8 | dryrun 视图 | 展示"若 enforce 会被拦截"的连接 | §7 |
+| 9 | 规则编辑器 | `match_resolved` 开关、求值顺序预览、解析域名联动校验 | §3.6 |
 
 ---
 
@@ -46,6 +47,7 @@ acl_rule
   domains         json  -- 精确匹配
   ports           json  -- ["443", "8000-9000"]
   protocols       json  -- ["tcp","udp"]，空=全部
+  match_resolved  bool default false  -- 见 §3.6，仅在 ip_cidrs 非空时有意义
   enabled       bool
 
 acl_group_user_group   -- ACL 组 ↔ 现有「用户组」，主要关联方式
@@ -141,6 +143,7 @@ node.acl_default_action  enum(allow,deny)         default 'allow'
 | `rules[].domain_suffixes` | string[] | 否 | `[]` | 后缀，不带前导 `.` |
 | `rules[].ports` | string[] | 否 | `[]` | `"N"` 或 `"N-M"` |
 | `rules[].protocols` | string[] | 否 | `[]`(=全部) | `tcp` / `udp` |
+| `rules[].match_resolved` | bool | 否 | `false` | 让本规则的 `ip_cidrs` 也管域名目标，见 §3.6 |
 
 匹配语义分三组，**组内 OR，组间 AND**：
 
@@ -187,19 +190,23 @@ policy_of(user):
         rules += sort(g.rules, by priority asc, then array index asc)
     return rules, first_non_null([g.default_action for g in groups]) ?? acl.default_action
 
-match_once(policy, dest_ip, dest_domain, port, proto):
+match_once(policy, dest_ip, dest_domain, port, proto, resolved_ips):
     for r in policy.rules:
         if matches(r, ...): return r.action, r.origin   # 第一条命中即决定
     return policy.default_action, "default"
 
+# matches() 的目标维度：dest_domain 非空时只看 domains / domain_suffixes，
+# 除非该规则带 match_resolved —— 那时它的 ip_cidrs 也拿 resolved_ips 来比，
+# 于是它和域名规则在同一条 priority 轴上竞争。见 §3.6
+
 check(user, dest_ip, dest_domain, port, proto, resolved_ips):
     p = policy_of(user)
-    action, origin = match_once(p, dest_ip, dest_domain, port, proto)
+    action, origin = match_once(p, dest_ip, dest_domain, port, proto, resolved_ips)
     if origin != "default" or dest_domain is null or resolved_ips is empty:
         return action, origin
     # 域名没命中任何规则，改用内核已解析出的地址再判
     for addr in resolved_ips:                            # 任一 deny 即 deny
-        a, o = match_once(p, addr, null, port, proto)
+        a, o = match_once(p, addr, null, port, proto, [])
         if a == deny: return deny, o
     return allow, first_explicit_origin_seen ?? "default"
 ```
@@ -213,8 +220,9 @@ check(user, dest_ip, dest_domain, port, proto, resolved_ips):
   `DestinationAddresses` 而不改写 `Destination`），且域名维度**没有命中任何规则**，
   节点会拿这些地址再判一轮，于是 `ip_cidrs` 也能管住域名寻址的流量。这是节点侧
   配置项，面板无需下发任何新字段。
-- 命名了域名的规则**优先于**解析地址：运营写了域名就是表达了对这个名字的意图，
-  allow/deny 两个方向都按它决定，解析地址不再参与。
+- 命名了域名的规则**默认优先于**解析地址：运营写了域名就是表达了对这个名字的意图，
+  allow/deny 两个方向都按它决定，解析地址不再参与。要推翻这个默认，见 §3.6 的
+  `match_resolved`。
 - 多个解析地址的聚合是**故意不对称的：任一地址被拒则整条连接被拒**。内核可能拨任意
   一个地址、还可能故障转移，所以"至少有一个被放行就放行"会让白名单被一个混合
   DNS 应答绕过；同样，黑名单也不能让一个被禁地址躲在允许地址后面。
@@ -312,6 +320,104 @@ xray 的 ACL 钩子在 `Dispatch` 里，比路由更早，session 里没有任�
 上这个字段无效，节点启动时会打一条 Warn 明说这件事（而不是静默无效），只能改用
 `domain_suffixes`。面板若同时管两种内核，UI 应当按节点内核类型给出不同提示。
 
+
+### 3.6 `rules[].match_resolved` —— 让 IP 规则和域名规则同台竞争
+
+§3.3 的默认语义有一个表达不出来的意图：**"这个地址上的服务放行，不管哪个名字指向它，
+即使那个名字落在一个被整体拒绝的域里。"**
+
+```jsonc
+{ "action": "allow", "priority": 10,  "ip_cidrs": ["10.0.0.1/32"] },
+{ "action": "deny",  "priority": 110, "domain_suffixes": ["corp.example.com"] }
+```
+
+客户端访问 `a.corp.example.com`（解析到 `10.0.0.1`）时，第一条**结构上就匹配不了** ——
+目标是域名，`matches()` 的目标维度只看 `domains` / `domain_suffixes`，`ip_cidrs` 那一支
+不参与。于是第二条命中，判定 deny，而解析回落只在"域名一条规则都没命中"时才跑，这里
+永远跑不到。改 priority 也没用，这不是顺序问题。
+
+给第一条加上 `match_resolved: true`，它的 CIDR 集合就会在**第一趟**拿 `resolved_ips` 来
+比，和域名规则在同一条 priority 轴上排队：
+
+```jsonc
+{ "action": "allow", "priority": 10,  "ip_cidrs": ["10.0.0.1/32"], "match_resolved": true },
+{ "action": "deny",  "priority": 100, "ip_cidrs": ["10.0.0.0/8"] },
+{ "action": "deny",  "priority": 110, "domain_suffixes": ["corp.example.com"] }
+```
+
+| 目标 | 结果 | 命中 |
+|---|---|---|
+| `a.corp.example.com` → `10.0.0.1` | allow | `#0`（p10 先命中，终局） |
+| `b.corp.example.com` → `10.0.0.1`（新名字，无需登记） | allow | `#0` |
+| `other.corp.example.com` → `10.0.0.50` | deny | `#2` |
+| `10.0.0.1`（IP 直连） | allow | `#0` |
+| `10.0.0.50`（IP 直连） | deny | `#1` |
+
+要点：
+
+- **逐规则 opt-in。** 不带这个字段的规则语义一字不变，已在线的配置不受影响。它推翻的是
+  "运营点了域名就以域名为准"这条默认，所以必须由运营显式表态，不能是全局开关。
+- **依赖 `acl_resolve_domains`。** 没有解析结果就没有可比的地址，规则静默不命中。面板
+  MUST 在勾选此项时检查目标域名的 zone 是否已在 `acl_resolve_domains` 里，否则给出告警。
+- **多地址聚合仍然不对称，但方向按 action 分：**
+  - `deny` + `match_resolved`：**任一**解析地址落在集合里即 deny。
+  - `allow` + `match_resolved`：**全部**解析地址都得落在集合里才 allow。
+  
+  混合 DNS 应答（`[10.0.0.1, 10.0.0.50]`）因此拿不到放行 —— 内核可能拨任意一个、还会
+  故障转移，"它挑了好的那个"不是 ACL 能依赖的前提。单 A 记录的常见情况下两条规则等价。
+- **`match_resolved` 只扩展 `ip_cidrs`。** 规则没写 `ip_cidrs` 就是个静默无效的标记，
+  节点直接拒绝整份配置（与"规则必须有至少一个匹配条件"同一立场）。
+- **xray 无效。** 和 §3.5 同一个原因：xray 的 ACL 钩子拿不到任何已解析地址。
+
+#### 什么时候不要用它
+
+只想放行**特定几个名字**时，直接写 `domains` / `domain_suffixes` 的 allow 更直白，也不
+依赖 DNS。`match_resolved` 的适用场景是判定依据**本质上是地址**——"这台机器上的服务
+可访问，叫什么无所谓"——且这个名字集合会变、不想维护名单。
+
+#### 面板实现要求
+
+**1. 规则编辑器加一个开关**，仅在「IP 网段」非空时可勾选（为空时置灰并显示禁用原因）。
+
+| 元素 | 文案 |
+|---|---|
+| 复选框标签 | `域名访问也按解析地址匹配` |
+| 副标题 | `让本规则的 IP 网段管住"客户端用域名访问"的流量` |
+| 帮助气泡 | `不勾选时，域名访问只由「域名」「域名后缀」规则判定，本规则的 IP 网段对它无效 —— 一次连接的目标要么是地址、要么是主机名，不可能两者皆是。`<br>`勾选后，节点会拿它自己解析出的地址来比对本规则的 IP 网段，于是本规则和域名规则在同一条优先级序列里竞争。`<br>`典型用途：整个公司域名已被整体拒绝，但要放行某台机器上的服务，且不想逐个登记指向它的域名。` |
+| 勾选后的行内提示 | `本规则将参与域名访问的判定。若它的优先级数值小于某条「拒绝域名」规则，该域名下解析到这些网段的访问会被放行 —— 这是有意的例外，请确认符合预期。` |
+| 网段为空时的禁用原因 | `请先填写 IP 网段。本开关只扩展 IP 网段的作用范围，不影响域名规则。` |
+
+**2. 三条校验**，前两条 MUST 阻止保存，第三条是警告：
+
+| 条件 | 文案 | 级别 |
+|---|---|---|
+| 勾选了开关但 `ip_cidrs` 为空 | `勾选「域名访问也按解析地址匹配」时必须填写 IP 网段，否则本规则对域名访问不会生效` | 拒绝保存（节点也会拒绝**整份**配置，见 §4） |
+| 勾选了开关，但节点是 xray 内核 | `xray 内核不支持按解析地址匹配（ACL 判定发生在路由之前，拿不到解析结果）。该节点上请改用「域名后缀」规则` | 拒绝保存或按节点内核禁用该开关 |
+| 勾选了开关，但相关域名的 zone 不在该节点的「需解析的域名后缀」里 | `节点未配置解析 {zone}，本规则对该域名下的访问不会生效。请先在节点配置的「需解析的域名后缀」中加入 {zone}` | 警告 + 一键补全按钮 |
+
+第三条的判定方式：取本组内所有 `deny` 域名规则的 `domain_suffixes`，逐个检查是否被该节点
+`acl_resolve_domains` 的任一后缀覆盖（按 label 边界，见 §3.3）。没被覆盖的就是这条警告里的
+`{zone}` —— 因为正是那些域名下的访问需要解析结果才能命中本规则。
+
+**3. 规则列表加一列「作用于」**，让"这条规则管不管域名"一眼可见：
+
+| `ip_cidrs` | 域名匹配器 | `match_resolved` | 列显示 |
+|---|---|---|---|
+| 有 | 无 | 否 | `IP 直连` |
+| 有 | 无 | 是 | `IP 直连 + 域名(解析)` |
+| 无 | 有 | — | `域名` |
+| 有 | 有 | 否 | `IP 直连 + 域名` |
+| 有 | 有 | 是 | `IP 直连 + 域名` |
+
+**4. 求值顺序预览。** 域名规则和 IP 规则现在会交错，光看分组后的列表推不出结果。组编辑页
+SHOULD 给一个"按优先级展开"的只读视图：把该用户所有组的规则按 §3.3 的 `policy_of` 拍平
+（组 priority → 规则 priority → 数组下标），带上「作用于」列和 origin 编号（`组id#下标`，
+与节点日志里的 `rule=` 字段一字一致），这样运营能拿日志直接对回某一行。
+
+**5. 模拟器要加「解析地址」输入。** §3.3 的 `match_once` 多了一个 `resolved_ips` 参数。
+模拟器若不接受这个输入，对带 `match_resolved` 的规则会给出与线上相反的结论。
+节点侧 `xbctl acl eval` 是同一套评估器的 CLI 封装，可直接用于对账。
+
 ---
 
 ## 4. 校验规范
@@ -331,6 +437,8 @@ xray 的 ACL 钩子在 `Dispatch` 里，比路由更早，session 里没有任�
 | `groups[].id` | `^[a-z0-9_-]{1,32}$`，同节点内唯一 | |
 | 规模 | 单组 CIDR ≤ 20000，单节点全组 CIDR 合计 ≤ 200000 | 超限拒绝并提示拆组 |
 | 空规则 | 一条 rule 的所有匹配维度全为空 → 拒绝（等于无条件命中，多半是误操作） | `规则至少需要一个匹配条件` |
+| `match_resolved` | 为 `true` 时 MUST 同时有 `ip_cidrs`（否则是静默无效的标记） | `match_resolved 需要配合 ip_cidrs` |
+| `match_resolved` | SHOULD 检查相关域名 zone 已在 `acl_resolve_domains` 里，否则规则永不命中 | 警告非拒绝 |
 
 节点侧对 loopback / link-local 的过滤逻辑可参照 `internal/kernel/singbox/config.go`
 的 `sanitizePrivateAllow`，面板校验保持同样口径。
@@ -455,8 +563,12 @@ xray 的 ACL 钩子在 `Dispatch` 里，比路由更早，session 里没有任�
 3. `implicit_dns_allow` 默认 `true`。若运营关掉它，UI MUST 提示"用户将无法解析域名，
    现象与节点宕机相同"。
 4. ACL 编辑权限 SHOULD 独立于普通节点编辑权限。
-5. 面板 SHOULD 提供"策略模拟器"：输入 用户 + 目标 IP/域名 + 端口，返回命中的规则与最终
-   动作，算法严格按 §3.3。这是运营自查的主要手段。
+5. 面板 SHOULD 提供"策略模拟器"：输入 用户 + 目标 IP/域名 + 端口 + 解析地址，返回命中的
+   规则与最终动作，算法严格按 §3.3。这是运营自查的主要手段。节点侧有等价实现可对照：
+   `xbctl acl eval --config - --groups <ids> <target>...`，它直接调用节点的评估器，
+   面板模拟器的输出应与它逐条一致。
+6. `match_resolved` 勾选项 MUST 有 §3.6 的联动校验。它推翻的是"运营点了域名就以域名为准"
+   这条默认语义，配错的表现是"规则看起来在那里但从不命中"，比语法错误难查得多。
 
 ---
 
@@ -483,6 +595,9 @@ USR="curl -s -H 'Authorization: Bearer $T' '$P/api/v1/server/UniProxy/user?node_
 | 7 | 合并已完成 | 用户同时通过用户组和单用户 override 关联 | 下发的 `acl_groups` 是**去重后的扁平数组** |
 | 8 | 悬空引用 | 删除一个仍被用户引用的组 | 用户的 `acl_groups` 中不再出现该 id |
 | 9 | 校验生效 | 尝试保存 `ip_cidrs: ["10.0.0/8"]`、`ports: ["70000"]`、全空 rule | 面板拒绝并给出可读错误，**不下发** |
+| 9b | `match_resolved` 下发 | 勾选该开关的规则，取 config | 规则里出现 `"match_resolved": true`；未勾选的规则**不含**该键 |
+| 9c | `match_resolved` 校验 | 勾选开关但清空 IP 网段后保存 | 面板拒绝；若误下发，节点会拒绝**整份** ACL 并保留旧策略（日志 `acl update rejected`） |
+| 9d | 解析域名联动 | 勾选开关，且组内有一条拒绝 `corp.example.com` 的域名规则，而节点 `acl_resolve_domains` 不含该后缀 | 面板给出 §3.6 第三条警告 |
 | 9b | 无 `null` | 关闭 ACL 后取 config；无组用户取 user | 无 `"acl": null`、无 `"acl_groups": null`（见 §10 陷阱 2） |
 | 9c | ETag 跨进程一致 | 多 worker 部署下并发取同一 config 若干次 | ETag 恒定；重启面板后仍为同一值（见 §10 陷阱 4） |
 | 10 | 危险配置拦截 | 节点设 `default_action: deny` 且无任何 allow 规则 | 阻止保存或强提示 |

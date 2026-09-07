@@ -158,6 +158,7 @@ func aclFromPanel(a *panel.ACLConfig) *ACLConfig {
 				DomainSuffixes: cloneStringSlice(r.DomainSuffixes),
 				Ports:          cloneStringSlice(r.Ports),
 				Protocols:      cloneStringSlice(r.Protocols),
+				MatchResolved:  r.MatchResolved,
 			})
 		}
 		out.Groups = append(out.Groups, group)
@@ -194,6 +195,7 @@ func aclToPanel(a *ACLConfig) *panel.ACLConfig {
 				DomainSuffixes: cloneStringSlice(r.DomainSuffixes),
 				Ports:          cloneStringSlice(r.Ports),
 				Protocols:      cloneStringSlice(r.Protocols),
+				MatchResolved:  r.MatchResolved,
 			})
 		}
 		out.Groups = append(out.Groups, group)

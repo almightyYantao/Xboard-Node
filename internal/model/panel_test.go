@@ -1,6 +1,7 @@
 package model
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -81,4 +82,44 @@ func TestNodeSpecFromPanelValidated(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
+}
+
+// The ACL rule struct is mirrored in three places (panel wire, model, and the
+// compiler). A field added to one and forgotten in a conversion is invisible:
+// the config validates, the node runs, and the rule quietly loses the part the
+// operator was relying on. Round-trip every matcher so the omission fails here.
+func TestACLRuleSurvivesPanelRoundTrip(t *testing.T) {
+	want := panel.ACLRule{
+		Action:         "allow",
+		Priority:       7,
+		IPCIDRs:        []string{"10.0.0.1/32"},
+		Domains:        []string{"a.corp.example.com"},
+		DomainSuffixes: []string{"corp.example.com"},
+		Ports:          []string{"443"},
+		Protocols:      []string{"tcp"},
+		MatchResolved:  true,
+	}
+	spec := NodeSpecFromPanel(&panel.NodeConfig{
+		Protocol:   "vless",
+		ServerPort: 443,
+		ACL: &panel.ACLConfig{
+			Mode:          "enforce",
+			DefaultAction: "deny",
+			Groups:        []panel.ACLGroup{{ID: "corp", Priority: 10, Rules: []panel.ACLRule{want}}},
+		},
+	})
+	if spec.ACL == nil || len(spec.ACL.Groups) != 1 || len(spec.ACL.Groups[0].Rules) != 1 {
+		t.Fatalf("acl lost in FromPanel: %+v", spec.ACL)
+	}
+	if !spec.ACL.Groups[0].Rules[0].MatchResolved {
+		t.Error("match_resolved lost in aclFromPanel")
+	}
+
+	got := spec.ToPanel().ACL
+	if got == nil || len(got.Groups) != 1 || len(got.Groups[0].Rules) != 1 {
+		t.Fatalf("acl lost in ToPanel: %+v", got)
+	}
+	if diff := got.Groups[0].Rules[0]; !reflect.DeepEqual(diff, want) {
+		t.Errorf("rule round-trip:\n got %+v\nwant %+v", diff, want)
+	}
 }

@@ -209,6 +209,9 @@ type ACLRule struct {
 	DomainSuffixes []string `json:"domain_suffixes,omitempty"`
 	Ports          []string `json:"ports,omitempty"`
 	Protocols      []string `json:"protocols,omitempty"`
+	// MatchResolved makes ip_cidrs apply to domain targets too, by the
+	// addresses the node resolved them to. See model.ACLRule.MatchResolved.
+	MatchResolved bool `json:"match_resolved,omitempty"`
 }
 
 // AutoThrottleConfig mirrors model.AutoThrottleConfig on the wire.

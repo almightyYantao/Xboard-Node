@@ -42,6 +42,19 @@ type ACLRule struct {
 	DomainSuffixes []string
 	Ports          []string
 	Protocols      []string
+
+	// MatchResolved lets IPCIDRs also match the addresses the kernel already
+	// resolved a domain target to, during the same pass that judges the name.
+	// Without it an ip_cidr rule can only ever govern a domain target through
+	// the fallback in acl.Policy.Evaluate, which runs only when no rule
+	// matched the name at all — so a domain_suffix deny anywhere in the list
+	// would settle the verdict first, no matter its priority.
+	//
+	// Opt-in per rule: it inverts the "the operator named the domain, so the
+	// domain decides" default, and that is a choice the operator has to make
+	// explicitly. Requires the node to resolve the name (see
+	// NodeSpec.ACLResolveDomains); without that there is nothing to match.
+	MatchResolved bool
 }
 
 // DNSAllowed reports the effective implicit-DNS setting.

@@ -79,6 +79,13 @@ func ValidateACLConfig(cfg *ACLConfig) error {
 				return fmt.Errorf("%s requires at least one match condition", path)
 			}
 
+			// match_resolved only extends ip_cidrs. Without any, the flag is a
+			// no-op the operator almost certainly did not intend — the same
+			// stance the check above takes on a matcher-less rule.
+			if r.MatchResolved && len(r.IPCIDRs) == 0 {
+				return fmt.Errorf("%s.match_resolved requires ip_cidrs", path)
+			}
+
 			allowRule := strings.EqualFold(strings.TrimSpace(r.Action), "allow")
 			for k, entry := range r.IPCIDRs {
 				prefix, err := parseACLCIDR(entry)

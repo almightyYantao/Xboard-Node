@@ -93,3 +93,32 @@ func BenchmarkEvaluate(b *testing.B) {
 		}
 	}
 }
+
+// The match_resolved path costs one IPSet lookup per resolved address inside
+// the first pass, where the plain path costs none. Pinned next to the others
+// so a regression here shows up as a number, not as a hunch.
+func BenchmarkEvaluateMatchResolved(b *testing.B) {
+	s := New()
+	if err := s.Update(&model.ACLConfig{
+		Mode:          "enforce",
+		DefaultAction: "allow",
+		Groups: []model.ACLGroup{{
+			ID: "corp",
+			Rules: []model.ACLRule{
+				{Action: "allow", Priority: 10, IPCIDRs: []string{"10.0.0.1/32"}, MatchResolved: true},
+				{Action: "deny", Priority: 100, IPCIDRs: []string{"10.0.0.0/8"}},
+				{Action: "deny", Priority: 110, DomainSuffixes: []string{"corp.example.com"}},
+			},
+		}},
+	}, users(user(1, "u1", "corp"))); err != nil {
+		b.Fatal(err)
+	}
+	dest := Dest{Domain: "a.corp.example.com", Port: 443, ResolvedIPs: ips("10.0.0.1")}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, origin := s.Lookup("u1").Evaluate(dest); origin == "" {
+			b.Fatal("empty origin")
+		}
+	}
+}

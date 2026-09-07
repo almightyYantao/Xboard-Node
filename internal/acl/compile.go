@@ -127,7 +127,7 @@ type indexedRule struct {
 }
 
 func compileRule(r model.ACLRule, origin string) (rule, error) {
-	out := rule{action: parseAction(r.Action), origin: origin}
+	out := rule{action: parseAction(r.Action), origin: origin, matchResolved: r.MatchResolved}
 
 	if len(r.IPCIDRs) > 0 {
 		var b netipx.IPSetBuilder

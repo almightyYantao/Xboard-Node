@@ -117,6 +117,13 @@ func (p *Policy) Check(dest Dest) Action {
 // Only when no rule matched the name at all do ResolvedIPs get a turn, which
 // is what lets an ip_cidr allowlist govern domain-addressed traffic.
 //
+// A rule carrying match_resolved opts out of that split: its CIDR set is tried
+// against ResolvedIPs during the first pass, so it competes with the domain
+// rules on priority alone. That is the only way to let an allow outrank a
+// domain_suffix deny — "allow whatever resolves to this address, even inside a
+// denied zone" is otherwise inexpressible, because the deny settles the verdict
+// before the fallback can run.
+//
 // Aggregating several candidate addresses is deliberately asymmetric: the
 // kernel may dial any of them, possibly failing over, so one denied address
 // denies the connection. "Any deny wins" is the only direction that holds for
@@ -205,6 +212,10 @@ type rule struct {
 	suffixes map[string]struct{}
 	hasDest  bool
 
+	// matchResolved extends ips to domain targets, matching them against the
+	// addresses the kernel resolved the name to. See model.ACLRule.
+	matchResolved bool
+
 	// port group; sorted by lo, searched by binary search
 	ports []portRange
 
@@ -243,12 +254,43 @@ func (r *rule) matchDest(d Dest) bool {
 				return true
 			}
 		}
-		return matchSuffix(r.suffixes, d.Domain)
+		if matchSuffix(r.suffixes, d.Domain) {
+			return true
+		}
+		return r.matchResolvedIPs(d.ResolvedIPs)
 	}
 	if r.ips != nil && d.IP.IsValid() {
 		return r.ips.Contains(d.IP)
 	}
 	return false
+}
+
+// matchResolvedIPs tests an opt-in rule's CIDR set against the addresses the
+// kernel resolved a domain target to.
+//
+// The aggregation is asymmetric for the same reason Policy.Evaluate's fallback
+// is: the kernel may dial any of these addresses and may fail over between
+// them, so one address in a deny set condemns the connection, while an allow
+// has to cover every address — otherwise a DNS answer that mixes one permitted
+// address in with forbidden ones would buy a permit for all of them.
+func (r *rule) matchResolvedIPs(ips []netip.Addr) bool {
+	if !r.matchResolved || r.ips == nil || len(ips) == 0 {
+		return false
+	}
+	if r.action == ActionDeny {
+		for _, ip := range ips {
+			if r.ips.Contains(ip.Unmap()) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, ip := range ips {
+		if !r.ips.Contains(ip.Unmap()) {
+			return false
+		}
+	}
+	return true
 }
 
 // matchSuffix reports whether host equals or is a subdomain of any entry.

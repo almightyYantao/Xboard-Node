@@ -214,3 +214,132 @@ func BenchmarkEvaluateResolved(b *testing.B) {
 		}
 	}
 }
+
+// ─── match_resolved ─────────────────────────────────────────────────────
+
+// allowResolvedInsideDeniedZone is the shape the flag exists for: a company
+// zone is denied wholesale, but one address inside it stays reachable — and
+// reachable by *any* name pointing at it, which is what rules out simply
+// enumerating the exempt hostnames.
+func allowResolvedInsideDeniedZone() *model.ACLConfig {
+	return &model.ACLConfig{
+		Mode:          "enforce",
+		DefaultAction: "allow",
+		Groups: []model.ACLGroup{{
+			ID: "corp",
+			Rules: []model.ACLRule{
+				{Action: "allow", Priority: 10, IPCIDRs: []string{"10.0.0.1/32"}, MatchResolved: true},
+				{Action: "deny", Priority: 100, IPCIDRs: []string{"10.0.0.0/8"}},
+				{Action: "deny", Priority: 110, DomainSuffixes: []string{"corp.example.com"}},
+			},
+		}},
+	}
+}
+
+func TestMatchResolvedOutranksDomainSuffixDeny(t *testing.T) {
+	s := New()
+	mustUpdate(t, s, allowResolvedInsideDeniedZone(), users(user(1, "u1", "corp")))
+	p := s.Lookup("u1")
+
+	// The exempt address wins on priority even though a later rule names the
+	// whole zone. Any hostname resolving there is covered, with no name list
+	// to maintain.
+	for _, host := range []string{"a.corp.example.com", "b.corp.example.com"} {
+		dest := Dest{Domain: host, Port: 443, ResolvedIPs: ips("10.0.0.1")}
+		if action, origin := p.Evaluate(dest); action != ActionAllow || origin != "corp#0" {
+			t.Errorf("%s: got %v/%q, want allow/corp#0", host, action, origin)
+		}
+	}
+
+	// A name in the same zone resolving elsewhere still falls to the zone
+	// deny. The flagged rule is an exemption, not a hole in the deny.
+	dest := Dest{Domain: "other.corp.example.com", Port: 443, ResolvedIPs: ips("10.0.0.50")}
+	if action, origin := p.Evaluate(dest); action != ActionDeny || origin != "corp#2" {
+		t.Errorf("other host: got %v/%q, want deny/corp#2", action, origin)
+	}
+
+	// An IP-addressed connection is unaffected by the flag: 10.0.0.1 is still
+	// allowed by the same rule, the rest of the range still denied.
+	if action, origin := p.Evaluate(Dest{IP: ip("10.0.0.1"), Port: 443}); action != ActionAllow || origin != "corp#0" {
+		t.Errorf("direct 10.0.0.1: got %v/%q, want allow/corp#0", action, origin)
+	}
+	if action, origin := p.Evaluate(Dest{IP: ip("10.0.0.50"), Port: 443}); action != ActionDeny || origin != "corp#1" {
+		t.Errorf("direct 10.0.0.50: got %v/%q, want deny/corp#1", action, origin)
+	}
+}
+
+// Without the flag the same rule set must behave as it did before it existed:
+// the domain rule settles the verdict and the resolved address never gets a
+// turn. This is the compatibility half of the feature — every config already
+// in the field relies on it.
+func TestWithoutMatchResolvedDomainDenyStillWins(t *testing.T) {
+	cfg := allowResolvedInsideDeniedZone()
+	cfg.Groups[0].Rules[0].MatchResolved = false
+
+	s := New()
+	mustUpdate(t, s, cfg, users(user(1, "u1", "corp")))
+
+	dest := Dest{Domain: "a.corp.example.com", Port: 443, ResolvedIPs: ips("10.0.0.1")}
+	if action, origin := s.Lookup("u1").Evaluate(dest); action != ActionDeny || origin != "corp#2" {
+		t.Errorf("got %v/%q, want deny/corp#2", action, origin)
+	}
+}
+
+// An allow has to cover every resolved address. A DNS answer mixing the
+// exempt address in with others must not buy a permit for the connection —
+// the kernel may dial any of them, and failover means "it picked the good
+// one" is not something the ACL can rely on.
+func TestMatchResolvedAllowRequiresEveryAddress(t *testing.T) {
+	s := New()
+	mustUpdate(t, s, allowResolvedInsideDeniedZone(), users(user(1, "u1", "corp")))
+
+	dest := Dest{
+		Domain:      "mixed.corp.example.com",
+		Port:        443,
+		ResolvedIPs: ips("10.0.0.1", "10.0.0.50"),
+	}
+	if action, origin := s.Lookup("u1").Evaluate(dest); action != ActionDeny || origin != "corp#2" {
+		t.Errorf("got %v/%q, want deny/corp#2", action, origin)
+	}
+}
+
+// A deny is the mirror image: one address inside the set condemns the whole
+// connection, even when the others are unremarkable.
+func TestMatchResolvedDenyMatchesAnyAddress(t *testing.T) {
+	s := New()
+	mustUpdate(t, s, &model.ACLConfig{
+		Mode:          "enforce",
+		DefaultAction: "allow",
+		Groups: []model.ACLGroup{{
+			ID: "corp",
+			Rules: []model.ACLRule{
+				{Action: "deny", IPCIDRs: []string{"10.0.0.0/8"}, MatchResolved: true},
+			},
+		}},
+	}, users(user(1, "u1", "corp")))
+	p := s.Lookup("u1")
+
+	dest := Dest{Domain: "split.example.com", Port: 443, ResolvedIPs: ips("1.1.1.1", "10.0.0.5")}
+	if action, origin := p.Evaluate(dest); action != ActionDeny || origin != "corp#0" {
+		t.Errorf("mixed answer: got %v/%q, want deny/corp#0", action, origin)
+	}
+
+	// Nothing resolved into the range: the flag adds no verdict of its own.
+	clean := Dest{Domain: "public.example.com", Port: 443, ResolvedIPs: ips("1.1.1.1")}
+	if action, origin := p.Evaluate(clean); action != ActionAllow || origin != OriginDefault {
+		t.Errorf("public answer: got %v/%q, want allow/default", action, origin)
+	}
+}
+
+// The flag needs the node to have resolved the name. With nothing resolved
+// there is nothing to match, and the rule must not accidentally match on an
+// empty address list.
+func TestMatchResolvedWithoutResolutionMatchesNothing(t *testing.T) {
+	s := New()
+	mustUpdate(t, s, allowResolvedInsideDeniedZone(), users(user(1, "u1", "corp")))
+
+	dest := Dest{Domain: "a.corp.example.com", Port: 443}
+	if action, origin := s.Lookup("u1").Evaluate(dest); action != ActionDeny || origin != "corp#2" {
+		t.Errorf("got %v/%q, want deny/corp#2", action, origin)
+	}
+}

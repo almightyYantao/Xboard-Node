@@ -215,6 +215,8 @@ func run(args []string) error {
 		return nil
 	case "config":
 		return runConfig(args[1:])
+	case "acl":
+		return runACL(args[1:])
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -232,6 +234,7 @@ func printUsage() {
   xbctl instance get <id> [--output text|json]
   xbctl config init --mode node|machine --panel-url URL --token TOKEN [flags]
   xbctl config health-port [--config PATH]
+  xbctl acl eval --config <path|-> [--groups a,b | --user UUID --users PATH] <target>...
   xbctl service status|start|stop|restart|enable|disable|logs
   xbctl health
   xbctl bind add-node --panel-url URL --token TOKEN --node-id ID [--node-type TYPE] [--kernel singbox|xray]

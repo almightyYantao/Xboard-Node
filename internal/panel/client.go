@@ -2,9 +2,12 @@ package panel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -35,6 +38,9 @@ type Client struct {
 	nodeType   string
 	machineID  int
 	httpClient *http.Client
+	// health is shared by every Client cloned via ForNode (they share httpClient),
+	// so consecutive timeouts from any node count against the same connection pool.
+	health *connHealth
 
 	configETag string
 	userETag   string
@@ -52,14 +58,112 @@ func NewClient(cfg config.PanelConfig) *Client {
 		nodeType:  cfg.NodeType,
 		machineID: cfg.MachineID,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        10,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Timeout:   requestTimeout,
+			Transport: newResettableTransport(newTransport),
+		},
+		health: &connHealth{},
+	}
+}
+
+const (
+	requestTimeout = 30 * time.Second
+
+	// After this many consecutive timed-out requests, switch to a fresh
+	// transport so the next request dials a new connection (belt and braces for
+	// the HTTP/2 ping below; also covers HTTP/1.1 keep-alive connections).
+	resetAfterTimeouts = 2
+)
+
+// HTTP/2 health check. Without it a long-lived connection that silently died
+// (NAT/middlebox dropped it, packets black-holed: TCP still ESTABLISHED,
+// Send-Q stuck) is reused forever — every request just waits out
+// requestTimeout, and since an HTTP/2 stream timeout does not close the
+// connection, the agent never recovers on its own.
+// Variables (not constants) so tests can shorten them.
+var (
+	h2SendPingTimeout  = 30 * time.Second // ping when nothing was received for this long
+	h2PingTimeout      = 15 * time.Second // close the connection if the ping isn't answered
+	h2WriteByteTimeout = 30 * time.Second // close the connection if writes make no progress
+)
+
+func newTransport() *http.Transport {
+	return &http.Transport{
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        10,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		HTTP2: &http.HTTP2Config{
+			SendPingTimeout:  h2SendPingTimeout,
+			PingTimeout:      h2PingTimeout,
+			WriteByteTimeout: h2WriteByteTimeout,
 		},
 	}
+}
+
+// resettableTransport delegates to an *http.Transport that can be swapped for a
+// fresh one. Just calling CloseIdleConnections is not enough: right after a
+// request times out its HTTP/2 stream may still be winding down, so the dead
+// connection is not "idle" yet and would be reused by the next request.
+type resettableTransport struct {
+	make func() *http.Transport
+	cur  atomic.Pointer[http.Transport]
+}
+
+func newResettableTransport(mk func() *http.Transport) *resettableTransport {
+	t := &resettableTransport{make: mk}
+	t.cur.Store(mk())
+	return t
+}
+
+func (t *resettableTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return t.cur.Load().RoundTrip(r)
+}
+
+func (t *resettableTransport) CloseIdleConnections() { t.cur.Load().CloseIdleConnections() }
+
+// reset swaps in a new transport; the old one's connections are closed once idle
+// (a dead one is closed by the HTTP/2 ping / write timeout).
+func (t *resettableTransport) reset() {
+	old := t.cur.Swap(t.make())
+	old.CloseIdleConnections()
+}
+
+// connHealth counts consecutive timed-out panel requests.
+type connHealth struct {
+	timeouts atomic.Int32
+}
+
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// observe records the outcome of one request and resets the connection pool
+// after resetAfterTimeouts consecutive timeouts.
+func (c *Client) observe(err error) {
+	if c.health == nil {
+		return
+	}
+	if err == nil || !isTimeout(err) {
+		c.health.timeouts.Store(0)
+		return
+	}
+	n := c.health.timeouts.Add(1)
+	if n < resetAfterTimeouts {
+		return
+	}
+	c.health.timeouts.Store(0)
+	if rt, ok := c.httpClient.Transport.(*resettableTransport); ok {
+		rt.reset()
+	} else {
+		c.httpClient.CloseIdleConnections()
+	}
+	nlog.Core().Warn("panel requests keep timing out, reconnecting with a fresh connection",
+		"consecutive_timeouts", n)
 }
 
 // ForNode returns a new client bound to a specific node_id, sharing the
@@ -72,6 +176,7 @@ func (c *Client) ForNode(nodeID int) *Client {
 		nodeType:   c.nodeType,
 		machineID:  c.machineID,
 		httpClient: c.httpClient,
+		health:     c.health,
 	}
 }
 
@@ -502,6 +607,7 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 	nlog.Core().Debug("panel request", "method", method, "path", path)
 
 	resp, err := c.httpClient.Do(req)
+	c.observe(err)
 	if err != nil {
 		c.apiFailure.Add(1)
 		return nil, err

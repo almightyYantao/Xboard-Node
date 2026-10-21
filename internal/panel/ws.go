@@ -121,6 +121,10 @@ type WSClient struct {
 
 	connected atomic.Bool
 
+	// connLog keeps reconnect attempts out of the log while the panel is
+	// unreachable: first failure WARN, then a summary every 10 min, INFO on recovery.
+	connLog nlog.Streak
+
 	// writeCh allows sending messages from outside the connect loop.
 	// It is set in connect() and cleared on disconnect.
 	writeCh chan wsMessage
@@ -151,6 +155,7 @@ func NewWSClient(wsURL string, token string, nodeID int, cfg WSClientConfig, onE
 		onEvent:  onEvent,
 		onStatus: onStatus,
 		onPing:   onPing,
+		connLog:  nlog.Streak{Name: "ws connection"},
 	}
 }
 
@@ -175,7 +180,7 @@ func (w *WSClient) Run(ctx context.Context) {
 		}
 
 		if err != nil {
-			nlog.Core().Warn("ws disconnected", "error", err)
+			w.connLog.Fail(err)
 			if !wasConnected {
 				w.notifyStatus(false)
 			}
@@ -262,10 +267,12 @@ func (w *WSClient) connect(ctx context.Context) error {
 		// It might be a data event already (server pushed sync before auth.success)
 		// Process it and continue
 		w.connected.Store(true)
+		w.connLog.OK()
 		w.notifyStatus(true)
 		w.handleMessage(firstMsg)
 	} else {
 		w.connected.Store(true)
+		w.connLog.OK()
 		w.notifyStatus(true)
 	}
 

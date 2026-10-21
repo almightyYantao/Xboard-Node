@@ -24,7 +24,7 @@ LB_NODE_STATS_LISTEN=127.0.0.1:65532 xboard-node -c config.yml
 | `access` | 访问目标聚合（面板开了访问日志才有数据）：`enabled since records`、`by_bytes` / `by_count`（各前 30：`host bytes up down count fails`） |
 | `alerts[]` | 异常：`kind`（shared / surge / dial）、`user` 或 `node`、`value`、`limit`、`rejects`、`since` |
 
-ConnSnapshot：`last_ok last_fail`（unix 秒，0 = 从未）、`last_error`、`fails`（自上次成功以来连续失败次数）、`fails_total`。
+ConnSnapshot：`last_ok last_fail`（unix 秒，0 = 从未）、`last_error`、`fails`（自上次成功以来连续失败次数）、`fail_since`（这一轮连续失败从什么时候开始）、`fails_total`。
 
 异常判定：
 
@@ -43,9 +43,22 @@ t <当前时间> <进程启动时间>
 n <节点> <计数起点> <运行中 0|1> <上行 B/s> <下行 B/s> <连接数> <在线用户> <在线 IP>
 u <节点> <计数起点> <用户> <上行字节> <下行字节>
 a <类型> <用户|节点> <值> <上限> <开始时间>
+c <调用> <节点|机器> <连续失败> <这轮开始> <最近失败> <最近成功> <超时 0|1>
 ```
 
+`c` 行是对面板的调用：节点的 `pull`（同步配置）/ `push`（上报流量），机器的 `discovery`（拉节点列表）/ `status`（上报状态）。日志里连续失败只打第一次和每 10 分钟一条汇总，这里每次都计数——路由器插件的「断连自动恢复」按它判断。
+
 `u` 行是从 `<计数起点>`（该节点服务启动的 unix 秒）累计的字节数；计数起点变了表示从零重新计。
+
+## 日志
+
+周期性的调用（同步配置、上报流量、上报访问日志、拉节点列表、上报机器状态、WS 重连）不再每次都打日志：
+
+- 成功：不打（`report pushed` 降为 DEBUG）
+- 连续失败：第一次打 WARN（`<调用> failed`，带原因），之后每 10 分钟最多一条 WARN 汇总（`<调用> still failing failures=… for=…`），其余为 DEBUG
+- 恢复：打一条 INFO（`<调用> recovered failures=… after=…`）
+
+启动、节点启动 / 停止 / 重试、证书、配置变化等状态变化照常是 INFO。
 
 ## 内存与开销
 

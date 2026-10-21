@@ -87,6 +87,12 @@ type Service struct {
 	// whether the panel currently has access logging on for this node.
 	lastStartErr error // why the last kernel start failed (main goroutine only)
 
+	// Quiet logs for the recurring panel calls: first failure WARN, then a
+	// summary every 10 min, INFO on recovery (see nlog.Streak).
+	pullLog   nlog.Streak
+	pushLog   nlog.Streak
+	accessLog nlog.Streak
+
 	statPull    localstats.ConnStat
 	statPush    localstats.ConnStat
 	accessLogOn atomic.Bool
@@ -186,6 +192,9 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		wsEvents:     make(chan controlplane.Event, 16),
 		wsStatusCh:   make(chan controlplane.StatusChange, 4),
 		pullResults:  make(chan pullResult, 1),
+		pullLog:      nlog.Streak{Name: "poll control plane"},
+		pushLog:      nlog.Streak{Name: "push report"},
+		accessLog:    nlog.Streak{Name: "push access log"},
 	}
 }
 
@@ -660,12 +669,13 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		defer s.pullActive.Store(false)
 		snapshot, err := s.source.Poll(ctx)
 		if err != nil {
-			nlog.Core().Error("poll control plane failed", "error", err)
+			s.pullLog.Fail(err)
 			s.statPull.Fail(err)
 			s.pullBackoff.onFailure()
 			return
 		}
 		s.statPull.OK()
+		s.pullLog.OK()
 		s.pullBackoff.onSuccess()
 
 		result := pullResult{certChanged: certChanged}
@@ -1166,7 +1176,7 @@ func (s *Service) pushReportAsync() {
 	go func() {
 		defer s.pushActive.Store(false)
 		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
-			nlog.Core().Warn("failed to push report", "error", err)
+			s.pushLog.Fail(err)
 			s.statPush.Fail(err)
 			if len(traffic) > 0 {
 				s.tracker.RestoreTraffic(traffic)
@@ -1179,6 +1189,7 @@ func (s *Service) pushReportAsync() {
 		}
 		s.pushBackoff.onSuccess()
 		s.statPush.OK()
+		s.pushLog.OK()
 		nlog.ReportPushed(len(traffic), len(online))
 	}()
 }
@@ -1273,9 +1284,10 @@ func (s *Service) pushAccessLogAsync() {
 	go func() {
 		enabled, updateTo, kick, err := pusher.PushAccessLog(logs, agent)
 		if err != nil {
-			nlog.Core().Warn("failed to push access log", "error", err, "records", len(logs))
+			s.accessLog.Fail(err, "records", len(logs))
 			return
 		}
+		s.accessLog.OK()
 		// 面板是开关权威来源：每轮按面板返回值同步本地状态
 		if enabled != nil {
 			s.kernel.SetAccessLogEnabled(*enabled)

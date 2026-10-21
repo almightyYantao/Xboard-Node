@@ -68,9 +68,12 @@ func TestConnStat(t *testing.T) {
 	if s.Fails != 2 || s.FailsTotal != 2 || s.LastFail == 0 || s.LastOK != 0 || len(s.LastError) > 310 {
 		t.Fatalf("after fails: %+v", s)
 	}
+	if s.FailSince == 0 || s.FailSince > s.LastFail {
+		t.Fatalf("streak start: %+v", s)
+	}
 	c.OK()
 	s = c.Snapshot()
-	if s.Fails != 0 || s.FailsTotal != 2 || s.LastOK == 0 {
+	if s.Fails != 0 || s.FailsTotal != 2 || s.LastOK == 0 || s.FailSince != 0 {
 		t.Fatalf("after ok: %+v", s)
 	}
 }
@@ -306,7 +309,9 @@ func TestCountersFormat(t *testing.T) {
 	e := newEngine()
 	t0 := time.Unix(1_700_000_000, 0)
 	v := view(4, t0, map[int][2]int64{7: {100, 200}}, map[int]map[string]bool{7: {"1.1.1.1": true}}, map[int][2]int64{7: {1000, 2000}}, nil)
-	e.step(t0, []NodeView{v}, nil)
+	v.Pull = ConnSnapshot{Fails: 3, FailSince: 1690, LastFail: 1700, LastOK: 1600, LastError: `Get "x": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`}
+	v.Push = ConnSnapshot{Fails: 1, FailSince: 1650, LastFail: 1650, LastError: "502 Bad Gateway"}
+	e.step(t0, []NodeView{v}, []MachineView{{ID: 9, Discovery: ConnSnapshot{LastOK: 1500}}})
 	var b strings.Builder
 	e.writeCounters(&b, t0)
 	lines := strings.Split(strings.TrimSpace(b.String()), "\n")
@@ -314,9 +319,26 @@ func TestCountersFormat(t *testing.T) {
 		fmt.Sprintf("t %d %d", t0.Unix(), startedAt.Unix()),
 		fmt.Sprintf("n 4 %d 1 10 20 3 1 1", t0.Unix()),
 		fmt.Sprintf("u 4 %d 7 1000 2000", t0.Unix()),
+		"c discovery 9 0 0 0 1500 0",
+		"c status 9 0 0 0 0 0",
+		"c pull 4 3 1690 1700 1600 1",
+		"c push 4 1 1650 1650 0 0",
 	}
 	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("counters:\n%s\nwant:\n%s", b.String(), strings.Join(want, "\n"))
+	}
+}
+
+func TestIsTimeout(t *testing.T) {
+	for msg, want := range map[string]bool{
+		`Post "https://p/api": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`: true,
+		"context deadline exceeded":    true,
+		"dial tcp: connection refused": false,
+		"":                             false,
+	} {
+		if got := (ConnSnapshot{LastError: msg}).IsTimeout(); got != want {
+			t.Errorf("IsTimeout(%q) = %v", msg, got)
+		}
 	}
 }
 

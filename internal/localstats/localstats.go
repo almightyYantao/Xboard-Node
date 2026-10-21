@@ -81,6 +81,7 @@ func Enabled() bool {
 // for concurrent use and on a nil receiver. Cost: a few atomic stores.
 type ConnStat struct {
 	lastOK, lastFail atomic.Int64
+	since            atomic.Int64 // first failure of the current streak
 	fails, total     atomic.Int64
 	lastErr          atomic.Pointer[string]
 }
@@ -99,8 +100,11 @@ func (c *ConnStat) Fail(err error) {
 	if c == nil {
 		return
 	}
-	c.lastFail.Store(time.Now().Unix())
-	c.fails.Add(1)
+	now := time.Now().Unix()
+	c.lastFail.Store(now)
+	if c.fails.Add(1) == 1 {
+		c.since.Store(now)
+	}
 	c.total.Add(1)
 	msg := "unknown error"
 	if err != nil {
@@ -112,12 +116,19 @@ func (c *ConnStat) Fail(err error) {
 	c.lastErr.Store(&msg)
 }
 
+// IsTimeout reports whether the latest failure was a request timeout (the
+// stuck-connection symptom the router plugin's watchdog acts on).
+func (s ConnSnapshot) IsTimeout() bool {
+	return strings.Contains(s.LastError, "Client.Timeout") || strings.Contains(s.LastError, "deadline exceeded")
+}
+
 // ConnSnapshot is a copy of a ConnStat.
 type ConnSnapshot struct {
 	LastOK     int64  `json:"last_ok"`              // unix seconds, 0 = never
 	LastFail   int64  `json:"last_fail"`            // unix seconds, 0 = never
 	LastError  string `json:"last_error,omitempty"` // message of the latest failure
 	Fails      int64  `json:"fails"`                // consecutive failures since the last success
+	FailSince  int64  `json:"fail_since,omitempty"` // when the current streak began (Fails > 0)
 	FailsTotal int64  `json:"fails_total"`          // failures since start
 }
 
@@ -127,6 +138,9 @@ func (c *ConnStat) Snapshot() ConnSnapshot {
 		return ConnSnapshot{}
 	}
 	s := ConnSnapshot{LastOK: c.lastOK.Load(), LastFail: c.lastFail.Load(), Fails: c.fails.Load(), FailsTotal: c.total.Load()}
+	if s.Fails > 0 {
+		s.FailSince = c.since.Load()
+	}
 	if p := c.lastErr.Load(); p != nil {
 		s.LastError = *p
 	}

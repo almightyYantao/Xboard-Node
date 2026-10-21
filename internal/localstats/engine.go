@@ -716,6 +716,13 @@ func (e *engine) userReport(uid int) UserReport {
 //	n <node> <epoch> <running 0|1> <up B/s> <down B/s> <conns> <online users> <online IPs>
 //	u <node> <epoch> <user> <up bytes> <down bytes>        cumulative since <epoch>
 //	a <kind> <user|node> <value> <limit> <since>
+//	c <call> <node|machine> <fails> <streak since> <last fail> <last ok> <timeout 0|1>
+//
+// c lines describe calls to the panel: pull / push per node, discovery /
+// status per machine. <fails> counts consecutive failures (0 after a
+// success); <timeout> is 1 when the latest failure was a request timeout.
+// Unlike the logs (which only show the first failure of a streak), these
+// count every attempt — the router plugin's watchdog relies on them.
 //
 // <epoch> identifies one run of a node's counters (unix seconds of its
 // start): when it changes, the counters started again from zero.
@@ -740,6 +747,21 @@ func (e *engine) writeCounters(w io.Writer, now time.Time) {
 		for uid, t := range v.Tracker.Totals {
 			fmt.Fprintf(&b, "u %d %d %d %d %d\n", v.ID, ep, uid, t[0], t[1])
 		}
+	}
+	conn := func(call string, id int, c ConnSnapshot) {
+		to := 0
+		if c.Fails > 0 && c.IsTimeout() {
+			to = 1
+		}
+		fmt.Fprintf(&b, "c %s %d %d %d %d %d %d\n", call, id, c.Fails, c.FailSince, c.LastFail, c.LastOK, to)
+	}
+	for _, m := range e.machines {
+		conn("discovery", m.ID, m.Discovery)
+		conn("status", m.ID, m.Status)
+	}
+	for _, v := range e.views {
+		conn("pull", v.ID, v.Pull)
+		conn("push", v.ID, v.Push)
 	}
 	for _, a := range e.alerts {
 		subj := a.User

@@ -64,6 +64,9 @@ type Orchestrator struct {
 	// Local stats endpoint: outcome of node discovery / machine status calls.
 	statDiscovery localstats.ConnStat
 	statStatus    localstats.ConnStat
+	// Quiet logs for the periodic calls (see nlog.Streak).
+	discoveryLog nlog.Streak
+	statusLog    nlog.Streak
 }
 
 // New creates a machine orchestrator from the given config.
@@ -81,6 +84,9 @@ func New(cfg *config.Config) *Orchestrator {
 		retry:     make(map[int]*nodeRetry),
 		mailboxes: make(map[int]*controlplane.NodeMailbox),
 		statuses:  make(map[int]chan<- controlplane.StatusChange),
+
+		discoveryLog: nlog.Streak{Name: "machine node discovery"},
+		statusLog:    nlog.Streak{Name: "machine status report"},
 	}
 }
 
@@ -336,11 +342,12 @@ func (o *Orchestrator) stopAll() {
 func (o *Orchestrator) rediscover(ctx context.Context) {
 	nodesResp, err := o.client.GetMachineNodes()
 	if err != nil {
-		nlog.Core().Warn("machine node discovery failed", "error", err)
+		o.discoveryLog.Fail(err)
 		o.statDiscovery.Fail(err)
 		return
 	}
 	o.statDiscovery.OK()
+	o.discoveryLog.OK()
 
 	o.setWanted(nodesResp.Nodes)
 	wanted := make(map[int]panel.MachineNode, len(nodesResp.Nodes))
@@ -394,11 +401,12 @@ func (o *Orchestrator) reportMachineStatus() {
 		s.NetInSpeed, s.NetOutSpeed,
 		service.Version(),
 	); err != nil {
-		nlog.Core().Warn("machine status report failed", "error", err)
+		o.statusLog.Fail(err)
 		o.statStatus.Fail(err)
 		return
 	}
 	o.statStatus.OK()
+	o.statusLog.OK()
 }
 
 // StatsMachineView implements localstats.MachineSource (sampled every 10 s

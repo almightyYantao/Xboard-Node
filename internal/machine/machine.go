@@ -36,6 +36,10 @@ type Orchestrator struct {
 
 	mu    sync.Mutex
 	nodes map[int]*nodeHandle // node_id → handle
+	// wanted is the latest node list from the panel; retry holds nodes whose
+	// service exited with an error and are waiting to be restarted.
+	wanted map[int]panel.MachineNode
+	retry  map[int]*nodeRetry
 
 	// Per-node mailbox keyed by node_id. Shared WS events are aggregated here
 	// and each node service drains the latest state when ready.
@@ -66,6 +70,8 @@ func New(cfg *config.Config) *Orchestrator {
 		cfg:       cfg,
 		client:    panel.NewClient(panelCfg),
 		nodes:     make(map[int]*nodeHandle),
+		wanted:    make(map[int]panel.MachineNode),
+		retry:     make(map[int]*nodeRetry),
 		mailboxes: make(map[int]*controlplane.NodeMailbox),
 		statuses:  make(map[int]chan<- controlplane.StatusChange),
 	}
@@ -89,6 +95,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	o.tryStartWS(ctx)
 
 	// Start initial nodes.
+	o.setWanted(nodesResp.Nodes)
 	for _, n := range nodesResp.Nodes {
 		o.startNode(ctx, n)
 	}
@@ -121,11 +128,16 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 		o.mu.Unlock()
 		return
 	}
+	if r := o.retry[mn.ID]; r != nil && time.Now().Before(r.next) {
+		o.mu.Unlock()
+		return // failed recently; the retry timer will start it
+	}
 
 	nodeCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	mb := controlplane.NewNodeMailbox()
-	o.nodes[mn.ID] = &nodeHandle{cancel: cancel, done: done, mailbox: mb}
+	h := &nodeHandle{cancel: cancel, done: done, mailbox: mb}
+	o.nodes[mn.ID] = h
 	o.mu.Unlock()
 
 	o.eventsMu.Lock()
@@ -172,13 +184,95 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 		mn.ID, mn.Type, mn.Name))
 
 	go func() {
-		defer close(done)
-		defer o.unregisterNode(mn.ID)
-		if err := svc.Run(nodeCtx); err != nil {
-			nlog.Core().Error("machine node exited with error",
-				"node_id", mn.ID, "error", err)
+		started := time.Now()
+		err := svc.Run(nodeCtx)
+		o.unregisterNode(mn.ID)
+		close(done)
+		if err == nil || nodeCtx.Err() != nil {
+			return // stopped on purpose
 		}
+		// The node died on its own (e.g. its port is taken, kernel failed to start).
+		// Without this it stayed in o.nodes forever and was never started again.
+		delay := o.nodeFailed(ctx, mn.ID, h, started)
+		nlog.Core().Error("machine node exited with error",
+			"node_id", mn.ID, "error", err, "retry_in", delay.String())
 	}()
+}
+
+// ─── Restart of failed nodes ─────────────────────────────────────────────
+
+const (
+	nodeRetryMin    = 10 * time.Second
+	nodeRetryMax    = 5 * time.Minute
+	nodeRetryStable = 10 * time.Minute // ran this long → earlier failures are forgotten
+)
+
+type nodeRetry struct {
+	attempts int
+	next     time.Time
+}
+
+// retryDelay is the wait before restart attempt n (n ≥ 1): 10s, 20s, 40s … capped at 5m.
+func retryDelay(n int) time.Duration {
+	d := nodeRetryMin
+	for i := 1; i < n && d < nodeRetryMax; i++ {
+		d *= 2
+	}
+	if d > nodeRetryMax {
+		d = nodeRetryMax
+	}
+	return d
+}
+
+// nodeFailed forgets the dead handle and schedules a restart with backoff.
+func (o *Orchestrator) nodeFailed(ctx context.Context, id int, h *nodeHandle, started time.Time) time.Duration {
+	o.mu.Lock()
+	if o.nodes[id] == h {
+		delete(o.nodes, id)
+	}
+	r := o.retry[id]
+	if r == nil || time.Since(started) >= nodeRetryStable {
+		r = &nodeRetry{}
+		o.retry[id] = r
+	}
+	r.attempts++
+	n := r.attempts
+	delay := retryDelay(n)
+	r.next = time.Now().Add(delay)
+	o.mu.Unlock()
+
+	time.AfterFunc(delay, func() {
+		if ctx.Err() != nil {
+			return
+		}
+		o.mu.Lock()
+		mn, ok := o.wanted[id]
+		if !ok {
+			delete(o.retry, id) // removed from the panel meanwhile
+		}
+		o.mu.Unlock()
+		if ok {
+			nlog.Core().Info(fmt.Sprintf("machine: restarting node %d after failure (attempt %d)", id, n))
+			o.startNode(ctx, mn)
+		}
+	})
+	return delay
+}
+
+// setWanted records the panel's current node list and drops retry state for
+// nodes that are gone.
+func (o *Orchestrator) setWanted(nodes []panel.MachineNode) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.wanted = make(map[int]panel.MachineNode, len(nodes))
+	for _, n := range nodes {
+		o.wanted[n.ID] = n
+	}
+	for id := range o.retry {
+		if _, ok := o.wanted[id]; !ok {
+			delete(o.retry, id)
+		}
+	}
 }
 
 func (o *Orchestrator) stopNode(nodeID int) {
@@ -230,6 +324,7 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 		return
 	}
 
+	o.setWanted(nodesResp.Nodes)
 	wanted := make(map[int]panel.MachineNode, len(nodesResp.Nodes))
 	for _, n := range nodesResp.Nodes {
 		wanted[n.ID] = n

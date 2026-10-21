@@ -6,6 +6,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
@@ -20,6 +21,10 @@ type snapshot struct {
 	connCount int
 	inSpeed   int64
 	outSpeed  int64
+	// totals is per-user cumulative traffic since this tracker was created.
+	// Only maintained when EnableTotals was called (local stats endpoint);
+	// nil otherwise.
+	totals map[int][2]int64
 }
 
 // Tracker computes per-user traffic deltas from cumulative counters
@@ -56,6 +61,12 @@ type Tracker struct {
 
 	// lastAliveIPsHash detects changes to avoid duplicate reports.
 	lastAliveIPsHash string
+
+	// totals accumulates per-user traffic since the tracker was created, for
+	// the optional local stats endpoint. nil = disabled (upstream default).
+	// Protected by mu — only written by Process.
+	totals  map[int][2]int64
+	created time.Time
 }
 
 func New() *Tracker {
@@ -63,6 +74,7 @@ func New() *Tracker {
 		lastSeen:       make(map[int][2]int64),
 		pendingTraffic: make(map[int][2]int64),
 		aliveIPsBuf:    make(map[int][]string),
+		created:        time.Now(),
 	}
 	// Publish initial empty snapshot.
 	t.live.Store(&snapshot{
@@ -115,6 +127,13 @@ func (t *Tracker) Process(
 
 			userSpeed[uid] = [2]int64{deltaUp, deltaDown}
 
+			if t.totals != nil {
+				tot := t.totals[uid]
+				tot[0] += deltaUp
+				tot[1] += deltaDown
+				t.totals[uid] = tot
+			}
+
 			cycleOut += deltaUp
 			cycleIn += deltaDown
 		}
@@ -126,8 +145,14 @@ func (t *Tracker) Process(
 		online[uid] = len(ips)
 	}
 
+	var totals map[int][2]int64
+	if t.totals != nil {
+		totals = copyTrafficMap(t.totals)
+	}
+
 	// Publish new snapshot (readers will see this atomically).
 	t.live.Store(&snapshot{
+		totals:    totals,
 		traffic:   copyTrafficMap(t.pendingTraffic),
 		userSpeed: userSpeed,
 		aliveIPs:  kernelAliveIPs, // kernel provides fresh copy each tick
@@ -318,6 +343,42 @@ func (t *Tracker) PerUserSpeed() map[int][2]int64 {
 		cp[uid] = v
 	}
 	return cp
+}
+
+// EnableTotals turns on per-user cumulative counters (see View). Call once
+// right after New, before the first Process. Costs one map copy per Process.
+func (t *Tracker) EnableTotals() {
+	t.mu.Lock()
+	if t.totals == nil {
+		t.totals = make(map[int][2]int64)
+	}
+	t.mu.Unlock()
+}
+
+// View is a read-only view of the latest snapshot. The maps are shared with
+// the published snapshot and MUST NOT be modified by the caller.
+type View struct {
+	Created   time.Time               // when this tracker was created (counters start at 0)
+	UserSpeed map[int][2]int64        // userID → [up, down] bytes of the last cycle
+	AliveIPs  map[int]map[string]bool // userID → set of source IPs
+	Totals    map[int][2]int64        // userID → [up, down] cumulative; nil unless EnableTotals
+	ConnCount int
+	InCycle   int64 // download bytes of the last cycle (all users)
+	OutCycle  int64 // upload bytes of the last cycle (all users)
+}
+
+// View returns the latest snapshot without copying. Lock-free.
+func (t *Tracker) View() View {
+	s := t.live.Load()
+	return View{
+		Created:   t.created,
+		UserSpeed: s.userSpeed,
+		AliveIPs:  s.aliveIPs,
+		Totals:    s.totals,
+		ConnCount: s.connCount,
+		InCycle:   s.inSpeed,
+		OutCycle:  s.outSpeed,
+	}
 }
 
 // copyTrafficMap creates a shallow copy of the traffic map.

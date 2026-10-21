@@ -298,8 +298,10 @@ func FullRestart(nl *NodeLog, reason string) {
 }
 
 // ReportPushed logs a report push event.
+// It runs every push interval, so it is DEBUG: failures and recoveries are
+// logged by the caller's Streak.
 func ReportPushed(users, online int) {
-	Core().Info(fmt.Sprintf("report pushed: %d users, %d online", users, online))
+	Core().Debug(fmt.Sprintf("report pushed: %d users, %d online", users, online))
 }
 
 // TrackerStats logs tracker statistics.

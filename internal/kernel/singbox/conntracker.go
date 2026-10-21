@@ -166,6 +166,73 @@ type ConnTracker struct {
 	accessMu      sync.Mutex
 	accessBuf     []model.AccessRecord
 	accessDropped atomic.Int64
+
+	// Outbound dial counters for the local stats endpoint: every tracked
+	// connection counts as an attempt, a HandshakeFailure callback as a
+	// failure. Always on (two atomic adds per connection).
+	dialTotal atomic.Uint64
+	dialFails atomic.Uint64
+
+	// Device-limit refusals per user (rare path; see noteDeviceReject).
+	rejMu   sync.Mutex
+	rejects map[int]*deviceReject
+}
+
+// deviceReject is the per-user tally of connections refused by the device
+// limit gate (for the local stats endpoint's shared-account hint).
+type deviceReject struct {
+	Count uint64
+	IPs   []string // most recent distinct source IPs, at most deviceRejectIPs
+}
+
+const deviceRejectIPs = 8
+
+func (t *ConnTracker) noteDeviceReject(uid int, ip string) {
+	t.rejMu.Lock()
+	defer t.rejMu.Unlock()
+	if t.rejects == nil {
+		t.rejects = make(map[int]*deviceReject)
+	}
+	r := t.rejects[uid]
+	if r == nil {
+		r = &deviceReject{}
+		t.rejects[uid] = r
+	}
+	r.Count++
+	for i, x := range r.IPs {
+		if x == ip {
+			r.IPs = append(r.IPs[:i], r.IPs[i+1:]...)
+			break
+		}
+	}
+	r.IPs = append(r.IPs, ip)
+	if len(r.IPs) > deviceRejectIPs {
+		r.IPs = r.IPs[len(r.IPs)-deviceRejectIPs:]
+	}
+}
+
+// DeviceRejects returns, per user, the number of connections refused by the
+// device limit since the tracker was created and the latest refused IPs.
+func (t *ConnTracker) DeviceRejects() map[int]DeviceRejectStat {
+	t.rejMu.Lock()
+	defer t.rejMu.Unlock()
+	out := make(map[int]DeviceRejectStat, len(t.rejects))
+	for uid, r := range t.rejects {
+		out[uid] = DeviceRejectStat{Count: r.Count, IPs: append([]string(nil), r.IPs...)}
+	}
+	return out
+}
+
+// DeviceRejectStat is a copy of one user's device-limit refusals.
+type DeviceRejectStat struct {
+	Count uint64
+	IPs   []string
+}
+
+// DialStats returns outbound connection attempts and dial failures since the
+// tracker was created.
+func (t *ConnTracker) DialStats() (total, fails uint64) {
+	return t.dialTotal.Load(), t.dialFails.Load()
 }
 
 // SetAccessLogEnabled toggles per-connection access logging.
@@ -438,6 +505,7 @@ func (t *ConnTracker) RoutedConnection(
 			if t.checkDeviceGate(us, uid, sourceIP, limit) {
 				nlog.Core().Info("singbox: device limit gate-keep, rejecting connection",
 					"user", uuid, "ip", sourceIP, "limit", limit)
+				t.noteDeviceReject(uid, sourceIP)
 				conn.Close()
 				return conn
 			}
@@ -461,6 +529,7 @@ func (t *ConnTracker) RoutedConnection(
 		lim = (*slf)(uuid)
 	}
 
+	t.dialTotal.Add(1)
 	tc := &trackedConn{
 		Conn:     conn,
 		tracker:  t,
@@ -507,6 +576,7 @@ func (t *ConnTracker) RoutedPacketConnection(
 			if t.checkDeviceGate(us, uid, sourceIP, limit) {
 				nlog.Core().Info("singbox: device limit gate-keep, rejecting UDP connection",
 					"user", uuid, "ip", sourceIP, "limit", limit)
+				t.noteDeviceReject(uid, sourceIP)
 				conn.Close()
 				return conn
 			}
@@ -529,6 +599,7 @@ func (t *ConnTracker) RoutedPacketConnection(
 		lim = (*slf)(uuid)
 	}
 
+	t.dialTotal.Add(1)
 	tc := &trackedPacketConn{
 		PacketConn: conn,
 		tracker:    t,
@@ -981,7 +1052,9 @@ func (c *trackedConn) WriterReplaceable() bool { return true }
 // 记录原因后转发给内层连接，保留各入站协议自身的失败响应行为。
 func (c *trackedConn) HandshakeFailure(err error) error {
 	if err != nil {
-		c.failReason.Store(ptrStr(cleanReason(err.Error())))
+		if c.failReason.Swap(ptrStr(cleanReason(err.Error()))) == nil && c.tracker != nil {
+			c.tracker.dialFails.Add(1)
+		}
 	}
 	return N.ReportHandshakeFailure(c.Conn, err)
 }
@@ -1123,7 +1196,9 @@ func (c *trackedPacketConn) WriterReplaceable() bool { return true }
 
 func (c *trackedPacketConn) HandshakeFailure(err error) error {
 	if err != nil {
-		c.failReason.Store(ptrStr(cleanReason(err.Error())))
+		if c.failReason.Swap(ptrStr(cleanReason(err.Error()))) == nil && c.tracker != nil {
+			c.tracker.dialFails.Add(1)
+		}
 	}
 	return N.ReportHandshakeFailure(c.PacketConn, err)
 }

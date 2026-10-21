@@ -230,3 +230,34 @@ func TestTrafficAccumulation(t *testing.T) {
 		t.Errorf("accumulated: got %v, want [350,600]", flushed[1])
 	}
 }
+
+func TestTotalsDisabledByDefault(t *testing.T) {
+	tr := New()
+	tr.Process(map[int][2]int64{1: {100, 200}}, nil, 1)
+	if v := tr.View(); v.Totals != nil {
+		t.Fatalf("totals should be nil when not enabled, got %v", v.Totals)
+	}
+}
+
+func TestTotalsSurviveFlushAndReset(t *testing.T) {
+	tr := New()
+	tr.EnableTotals()
+	tr.Process(map[int][2]int64{1: {100, 200}}, map[int]map[string]bool{1: {"1.1.1.1": true}}, 3)
+	tr.FlushTraffic() // pushing to the panel must not reset local totals
+	tr.Process(map[int][2]int64{1: {150, 260}}, nil, 1)
+	// kernel restart: counters go back to small values
+	tr.Process(map[int][2]int64{1: {10, 20}, 2: {5, 5}}, nil, 1)
+	v := tr.View()
+	if v.Totals[1] != [2]int64{160, 280} {
+		t.Fatalf("user 1 totals: got %v, want [160 280]", v.Totals[1])
+	}
+	if v.Totals[2] != [2]int64{5, 5} {
+		t.Fatalf("user 2 totals: got %v", v.Totals[2])
+	}
+	if v.UserSpeed[1] != [2]int64{10, 20} || v.ConnCount != 1 {
+		t.Fatalf("view speed/conn: %v %d", v.UserSpeed[1], v.ConnCount)
+	}
+	if v.Created.IsZero() {
+		t.Fatal("created not set")
+	}
+}

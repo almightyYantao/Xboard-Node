@@ -25,6 +25,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel/singbox"
 	"github.com/cedar2025/xboard-node/internal/kernel/xray"
 	"github.com/cedar2025/xboard-node/internal/limiter"
+	"github.com/cedar2025/xboard-node/internal/localstats"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/monitor"
 	"github.com/cedar2025/xboard-node/internal/nlog"
@@ -81,6 +82,14 @@ type Service struct {
 
 	// metricsMu: lastUsers, lastConfig, wsClient, wsDisconnectAt (buildMetrics vs main loop).
 	metricsMu sync.RWMutex
+
+	// Local stats endpoint (internal/localstats): panel call outcomes and
+	// whether the panel currently has access logging on for this node.
+	lastStartErr error // why the last kernel start failed (main goroutine only)
+
+	statPull    localstats.ConnStat
+	statPush    localstats.ConnStat
+	accessLogOn atomic.Bool
 }
 
 // pullResult carries the outcome of an async pullViaAPI back to the main goroutine.
@@ -158,12 +167,17 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	l := limiter.New()
 	st := limiter.NewSpeedTracker(l)
 
+	tr := tracker.New()
+	if localstats.Enabled() {
+		tr.EnableTotals() // per-user totals for the local stats endpoint
+	}
+
 	return &Service{
 		cfg:          cfg,
 		source:       cp,
 		sink:         cp,
 		kernel:       k,
-		tracker:      tracker.New(),
+		tracker:      tr,
 		limiter:      l,
 		acl:          acl.New(),
 		speedTracker: st,
@@ -187,6 +201,7 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("initial setup: %w", err)
 	}
 	defer s.kernel.Stop()
+	defer localstats.RegisterNode(s)()
 
 	// Set up tickers
 	trackTicker := time.NewTicker(time.Duration(s.cfg.Node.TrackInterval) * time.Second)
@@ -258,6 +273,7 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	s.kernel.SetDeviceLimitFunc(s.limiter.GetDeviceLimitByUUID)
 	s.kernel.SetACLFunc(s.acl.Lookup)
 	s.kernel.SetAccessLogEnabled(s.cfg.Node.AccessLog)
+	s.accessLogOn.Store(s.cfg.Node.AccessLog)
 
 	bootstrap, err := s.source.Initial(ctx, s.wsMetrics, s.wsEvents, s.wsStatusCh)
 	if err != nil {
@@ -322,6 +338,11 @@ func (s *Service) initialSetup(ctx context.Context) error {
 
 	s.applyRemoteOverrides(ctx, bootstrap.Config)
 	if !s.startKernel(bootstrap.Config, bootstrap.Users) {
+		// Keep the cause (e.g. "listen tcp :443: bind: address already in use"):
+		// the machine orchestrator logs it and the local stats show it.
+		if s.lastStartErr != nil {
+			return fmt.Errorf("start kernel: %w", s.lastStartErr)
+		}
 		return fmt.Errorf("start kernel")
 	}
 	s.markMailboxReadyAndDrain(ctx)
@@ -640,9 +661,11 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		snapshot, err := s.source.Poll(ctx)
 		if err != nil {
 			nlog.Core().Error("poll control plane failed", "error", err)
+			s.statPull.Fail(err)
 			s.pullBackoff.onFailure()
 			return
 		}
+		s.statPull.OK()
 		s.pullBackoff.onSuccess()
 
 		result := pullResult{certChanged: certChanged}
@@ -780,8 +803,10 @@ func (s *Service) refreshACL() {
 func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 	if err := s.kernel.Start(nc, users, s.cert.TLSCert()); err != nil {
 		nlog.Core().Error("failed to start kernel", "error", err)
+		s.lastStartErr = err
 		return false
 	}
+	s.lastStartErr = nil
 
 	s.appliedState.Config = nc
 	s.appliedState.Users = users
@@ -1142,6 +1167,7 @@ func (s *Service) pushReportAsync() {
 		defer s.pushActive.Store(false)
 		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 			nlog.Core().Warn("failed to push report", "error", err)
+			s.statPush.Fail(err)
 			if len(traffic) > 0 {
 				s.tracker.RestoreTraffic(traffic)
 			}
@@ -1152,6 +1178,7 @@ func (s *Service) pushReportAsync() {
 			return
 		}
 		s.pushBackoff.onSuccess()
+		s.statPush.OK()
 		nlog.ReportPushed(len(traffic), len(online))
 	}()
 }
@@ -1206,6 +1233,8 @@ func (s *Service) pushAccessLogAsync() {
 		return
 	}
 	records := s.kernel.DrainAccessLog() // 可能为空：此时仅作为开关/版本轮询
+	// 本机统计接口开启时，另外折算一份聚合（只读 records，不改变下面推面板的内容）
+	localstats.AddAccess(records)
 	logs := make([]map[string]any, 0, len(records))
 	aclRecords := 0
 	for _, r := range records {
@@ -1250,6 +1279,7 @@ func (s *Service) pushAccessLogAsync() {
 		// 面板是开关权威来源：每轮按面板返回值同步本地状态
 		if enabled != nil {
 			s.kernel.SetAccessLogEnabled(*enabled)
+			s.accessLogOn.Store(*enabled)
 		}
 		// 面板请求升级到不同版本时，触发一次自更新
 		if updateTo != "" && updateTo != agentVersion {
@@ -1701,4 +1731,65 @@ func stringValue(v any) string {
 	default:
 		return ""
 	}
+}
+
+// dialStatser / deviceRejecter are optional kernel capabilities used by the
+// local stats endpoint (sing-box only).
+type dialStatser interface {
+	DialStats() (total, fails uint64)
+}
+
+type deviceRejecter interface {
+	DeviceRejects() map[int]singbox.DeviceRejectStat
+}
+
+// StatsView implements localstats.NodeSource. Called by the stats sampler
+// every 10 s (only when the endpoint is enabled): tracker data is a
+// lock-free snapshot, the rest are short read locks / atomics.
+func (s *Service) StatsView() localstats.NodeView {
+	v := localstats.NodeView{
+		ID:            s.cfg.Panel.NodeID,
+		Kernel:        cfgKernelType(s.cfg),
+		Running:       s.kernel.IsRunning(),
+		TrackInterval: s.cfg.Node.TrackInterval,
+		Tracker:       s.tracker.View(),
+		AccessLog:     s.accessLogOn.Load(),
+		Pull:          s.statPull.Snapshot(),
+		Push:          s.statPush.Snapshot(),
+		WS:            -1,
+	}
+	s.metricsMu.RLock()
+	if s.lastConfig != nil {
+		v.Protocol, v.Port = s.lastConfig.Protocol, s.lastConfig.ServerPort
+	}
+	users, ws := s.lastUsers, s.wsClient
+	s.metricsMu.RUnlock()
+	if ws != nil {
+		v.WS = 0
+		if ws.IsConnected() {
+			v.WS = 1
+		}
+	}
+	v.Users = make(map[int]localstats.UserMeta, len(users))
+	for _, u := range users {
+		v.Users[u.ID] = localstats.UserMeta{UUID: u.UUID, DeviceLimit: u.DeviceLimit}
+	}
+	if v.Running {
+		if c, ok := s.kernel.(userConnCounter); ok {
+			v.UserConns = c.GetUserConnCounts()
+		}
+	}
+	if d, ok := s.kernel.(dialStatser); ok {
+		v.DialSupported = true
+		v.DialTotal, v.DialFails = d.DialStats()
+	}
+	if r, ok := s.kernel.(deviceRejecter); ok {
+		if m := r.DeviceRejects(); len(m) > 0 {
+			v.Rejects = make(map[int]localstats.RejectStat, len(m))
+			for uid, x := range m {
+				v.Rejects[uid] = localstats.RejectStat{Count: x.Count, IPs: x.IPs}
+			}
+		}
+	}
+	return v
 }

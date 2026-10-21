@@ -6,11 +6,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/controlplane"
+	"github.com/cedar2025/xboard-node/internal/localstats"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/monitor"
 	"github.com/cedar2025/xboard-node/internal/nlog"
@@ -57,6 +60,10 @@ type Orchestrator struct {
 
 	pullInterval time.Duration
 	pushInterval time.Duration
+
+	// Local stats endpoint: outcome of node discovery / machine status calls.
+	statDiscovery localstats.ConnStat
+	statStatus    localstats.ConnStat
 }
 
 // New creates a machine orchestrator from the given config.
@@ -84,6 +91,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("initial node discovery: %w", err)
 	}
+	o.statDiscovery.OK()
 
 	o.applyIntervals(nodesResp.BaseConfig)
 	o.applyAgentTarget(nodesResp.Agent)
@@ -93,6 +101,8 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	// Start machine-level WS as early as possible so sync.nodes can reach an
 	// empty machine before the first node is attached.
 	o.tryStartWS(ctx)
+	// After tryStartWS: o.ws is only written there, before the sampler can read it.
+	defer localstats.RegisterMachine(o)()
 
 	// Start initial nodes.
 	o.setWanted(nodesResp.Nodes)
@@ -193,7 +203,7 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 		}
 		// The node died on its own (e.g. its port is taken, kernel failed to start).
 		// Without this it stayed in o.nodes forever and was never started again.
-		delay := o.nodeFailed(ctx, mn.ID, h, started)
+		delay := o.nodeFailed(ctx, mn.ID, h, started, err)
 		nlog.Core().Error("machine node exited with error",
 			"node_id", mn.ID, "error", err, "retry_in", delay.String())
 	}()
@@ -210,6 +220,8 @@ const (
 type nodeRetry struct {
 	attempts int
 	next     time.Time
+	lastErr  string    // why the last start failed (shown by the local stats endpoint)
+	lastExit time.Time // when it failed
 }
 
 // retryDelay is the wait before restart attempt n (n ≥ 1): 10s, 20s, 40s … capped at 5m.
@@ -225,7 +237,7 @@ func retryDelay(n int) time.Duration {
 }
 
 // nodeFailed forgets the dead handle and schedules a restart with backoff.
-func (o *Orchestrator) nodeFailed(ctx context.Context, id int, h *nodeHandle, started time.Time) time.Duration {
+func (o *Orchestrator) nodeFailed(ctx context.Context, id int, h *nodeHandle, started time.Time, cause error) time.Duration {
 	o.mu.Lock()
 	if o.nodes[id] == h {
 		delete(o.nodes, id)
@@ -236,6 +248,10 @@ func (o *Orchestrator) nodeFailed(ctx context.Context, id int, h *nodeHandle, st
 		o.retry[id] = r
 	}
 	r.attempts++
+	if cause != nil {
+		r.lastErr = cause.Error()
+	}
+	r.lastExit = time.Now()
 	n := r.attempts
 	delay := retryDelay(n)
 	r.next = time.Now().Add(delay)
@@ -321,8 +337,10 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 	nodesResp, err := o.client.GetMachineNodes()
 	if err != nil {
 		nlog.Core().Warn("machine node discovery failed", "error", err)
+		o.statDiscovery.Fail(err)
 		return
 	}
+	o.statDiscovery.OK()
 
 	o.setWanted(nodesResp.Nodes)
 	wanted := make(map[int]panel.MachineNode, len(nodesResp.Nodes))
@@ -377,7 +395,52 @@ func (o *Orchestrator) reportMachineStatus() {
 		service.Version(),
 	); err != nil {
 		nlog.Core().Warn("machine status report failed", "error", err)
+		o.statStatus.Fail(err)
+		return
 	}
+	o.statStatus.OK()
+}
+
+// StatsMachineView implements localstats.MachineSource (sampled every 10 s
+// when the local stats endpoint is enabled).
+func (o *Orchestrator) StatsMachineView() localstats.MachineView {
+	v := localstats.MachineView{
+		ID:        o.cfg.Machine.MachineID,
+		Panel:     panelHost(o.cfg.Panel.URL),
+		WS:        -1,
+		Discovery: o.statDiscovery.Snapshot(),
+		Status:    o.statStatus.Snapshot(),
+	}
+	o.mu.Lock()
+	for id, mn := range o.wanted {
+		n := localstats.MachineNode{ID: id, Name: mn.Name, Type: mn.Type}
+		_, n.Running = o.nodes[id]
+		if r := o.retry[id]; r != nil {
+			n.Attempts, n.NextRetry, n.LastError = r.attempts, r.next.Unix(), r.lastErr
+			if !r.lastExit.IsZero() {
+				n.LastExit = r.lastExit.Unix()
+			}
+		}
+		v.Nodes = append(v.Nodes, n)
+	}
+	o.mu.Unlock()
+	sort.Slice(v.Nodes, func(i, j int) bool { return v.Nodes[i].ID < v.Nodes[j].ID })
+	if ws := o.ws; ws != nil {
+		v.WS = 0
+		if ws.IsConnected() {
+			v.WS = 1
+		}
+	}
+	return v
+}
+
+// panelHost keeps only the host of the panel URL (no path, query or token).
+func panelHost(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Host
 }
 
 // ─── WS mux ─────────────────────────────────────────────────────────────

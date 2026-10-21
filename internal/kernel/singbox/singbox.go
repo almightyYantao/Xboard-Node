@@ -88,6 +88,24 @@ func (s *SingBox) DrainAccessLog() []model.AccessRecord {
 	return nil
 }
 
+// DialStats returns outbound connection attempts / dial failures of the
+// current tracker (reset when the kernel restarts).
+func (s *SingBox) DialStats() (total, fails uint64) {
+	if ct := s.connTrackerSafe(); ct != nil {
+		return ct.DialStats()
+	}
+	return 0, 0
+}
+
+// DeviceRejects returns per-user device-limit refusals of the current
+// tracker as (count, recent IPs).
+func (s *SingBox) DeviceRejects() map[int]DeviceRejectStat {
+	if ct := s.connTrackerSafe(); ct != nil {
+		return ct.DeviceRejects()
+	}
+	return nil
+}
+
 // ACLDenials returns the exact number of connections the ACL rejected (or
 // would have rejected, in dry-run) since the current tracker was created.
 // Records may be sampled when the buffer fills; this count never is.

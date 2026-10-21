@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/localstats"
 	"github.com/cedar2025/xboard-node/internal/machine"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/service"
@@ -53,6 +54,11 @@ func main() {
 
 	// Apply runtime memory tuning before anything else allocates.
 	applyRuntimeConfig(instances[0].Runtime)
+
+	// Optional read-only stats on loopback (LB_NODE_STATS_LISTEN); off by default.
+	if err := localstats.Start(context.Background(), version); err != nil {
+		nlog.Core().Warn("local stats endpoint disabled", "error", err)
+	}
 
 	runWithReload(rootCfg, *configPath)
 }

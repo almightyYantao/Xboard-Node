@@ -79,6 +79,7 @@ Legacy single-panel config is fully compatible. Appending bindings auto-migrates
 - Custom routes: [docs-custom-routes.md](docs-custom-routes.md)
 - Custom outbounds: [docs-custom-outbounds.md](docs-custom-outbounds.md)
 - DNS providers (ACME DNS-01): [docs-dns-providers.md](docs-dns-providers.md)
+- Local stats endpoint (loopback only, off by default): [docs-local-stats.md](docs-local-stats.md)
 
 ## License
 

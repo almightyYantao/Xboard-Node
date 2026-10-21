@@ -94,9 +94,14 @@ func newH2Client(t *testing.T) (*Client, *blackholeProxy) {
 	p := newBlackholeProxy(t, ts.Listener.Addr().String())
 	c := NewClient(config.PanelConfig{URL: "https://" + p.ln.Addr().String(), Token: "t", NodeID: 1})
 	c.httpClient.Timeout = time.Second
-	tr := c.httpClient.Transport.(*http.Transport)
-	tr.TLSClientConfig = ts.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
-	t.Cleanup(tr.CloseIdleConnections)
+	tlsCfg := ts.Client().Transport.(*http.Transport).TLSClientConfig
+	rt := newResettableTransport(func() *http.Transport {
+		tr := newTransport()
+		tr.TLSClientConfig = tlsCfg.Clone()
+		return tr
+	})
+	c.httpClient.Transport = rt
+	t.Cleanup(rt.CloseIdleConnections)
 	return c, p
 }
 

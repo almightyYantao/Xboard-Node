@@ -59,7 +59,7 @@ func NewClient(cfg config.PanelConfig) *Client {
 		machineID: cfg.MachineID,
 		httpClient: &http.Client{
 			Timeout:   requestTimeout,
-			Transport: newTransport(),
+			Transport: newResettableTransport(newTransport),
 		},
 		health: &connHealth{},
 	}
@@ -68,8 +68,8 @@ func NewClient(cfg config.PanelConfig) *Client {
 const (
 	requestTimeout = 30 * time.Second
 
-	// After this many consecutive timed-out requests, drop the pooled idle
-	// connections so the next request dials a fresh one (belt and braces for
+	// After this many consecutive timed-out requests, switch to a fresh
+	// transport so the next request dials a new connection (belt and braces for
 	// the HTTP/2 ping below; also covers HTTP/1.1 keep-alive connections).
 	resetAfterTimeouts = 2
 )
@@ -101,6 +101,34 @@ func newTransport() *http.Transport {
 	}
 }
 
+// resettableTransport delegates to an *http.Transport that can be swapped for a
+// fresh one. Just calling CloseIdleConnections is not enough: right after a
+// request times out its HTTP/2 stream may still be winding down, so the dead
+// connection is not "idle" yet and would be reused by the next request.
+type resettableTransport struct {
+	make func() *http.Transport
+	cur  atomic.Pointer[http.Transport]
+}
+
+func newResettableTransport(mk func() *http.Transport) *resettableTransport {
+	t := &resettableTransport{make: mk}
+	t.cur.Store(mk())
+	return t
+}
+
+func (t *resettableTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return t.cur.Load().RoundTrip(r)
+}
+
+func (t *resettableTransport) CloseIdleConnections() { t.cur.Load().CloseIdleConnections() }
+
+// reset swaps in a new transport; the old one's connections are closed once idle
+// (a dead one is closed by the HTTP/2 ping / write timeout).
+func (t *resettableTransport) reset() {
+	old := t.cur.Swap(t.make())
+	old.CloseIdleConnections()
+}
+
 // connHealth counts consecutive timed-out panel requests.
 type connHealth struct {
 	timeouts atomic.Int32
@@ -129,8 +157,12 @@ func (c *Client) observe(err error) {
 		return
 	}
 	c.health.timeouts.Store(0)
-	c.httpClient.CloseIdleConnections()
-	nlog.Core().Warn("panel requests keep timing out, dropped pooled connections to reconnect",
+	if rt, ok := c.httpClient.Transport.(*resettableTransport); ok {
+		rt.reset()
+	} else {
+		c.httpClient.CloseIdleConnections()
+	}
+	nlog.Core().Warn("panel requests keep timing out, reconnecting with a fresh connection",
 		"consecutive_timeouts", n)
 }
 

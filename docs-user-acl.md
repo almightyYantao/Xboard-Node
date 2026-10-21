@@ -199,16 +199,20 @@ match_once(policy, dest_ip, dest_domain, port, proto, resolved_ips):
 # 除非该规则带 match_resolved —— 那时它的 ip_cidrs 也拿 resolved_ips 来比，
 # 于是它和域名规则在同一条 priority 轴上竞争。见 §3.6
 
+judge_addr(p, dest_domain, addr, port, proto):          # 一个解析地址判一次
+    a, o = match_once(p, null, dest_domain, port, proto, [addr])
+    if o != "default": return a, o
+    return match_once(p, addr, null, port, proto, [])   # 域名没命中，按 IP 再判
+
 check(user, dest_ip, dest_domain, port, proto, resolved_ips):
     p = policy_of(user)
-    action, origin = match_once(p, dest_ip, dest_domain, port, proto, resolved_ips)
-    if origin != "default" or dest_domain is null or resolved_ips is empty:
-        return action, origin
-    # 域名没命中任何规则，改用内核已解析出的地址再判
-    for addr in resolved_ips:                            # 任一 deny 即 deny
-        a, o = match_once(p, addr, null, port, proto, [])
-        if a == deny: return deny, o
-    return allow, first_explicit_origin_seen ?? "default"
+    if dest_domain is null or resolved_ips is empty:
+        return match_once(p, dest_ip, dest_domain, port, proto, []), dial_only=null
+    allowed = [a for a in resolved_ips if judge_addr(p, dest_domain, a, ...) == allow]
+    if allowed is empty:
+        return deny, 第一个具名 deny 规则的 origin ?? "default"
+    dial_only = stable_sort(allowed, 内网地址在前)      # 节点只拨这些，按这个顺序
+    return allow, judge_addr(dial_only[0]) 的 origin, dial_only
 ```
 
 要点：
@@ -223,9 +227,11 @@ check(user, dest_ip, dest_domain, port, proto, resolved_ips):
 - 命名了域名的规则**默认优先于**解析地址：运营写了域名就是表达了对这个名字的意图，
   allow/deny 两个方向都按它决定，解析地址不再参与。要推翻这个默认，见 §3.6 的
   `match_resolved`。
-- 多个解析地址的聚合是**故意不对称的：任一地址被拒则整条连接被拒**。内核可能拨任意
-  一个地址、还可能故障转移，所以"至少有一个被放行就放行"会让白名单被一个混合
-  DNS 应答绕过；同样，黑名单也不能让一个被禁地址躲在允许地址后面。
+- 多个解析地址**逐个判定**：放行的留下、被拒的剔除，节点（enforce 下）**只拨留下的
+  地址**，一个都没留下才拒绝整条连接。白名单不会被混合 DNS 应答绕过 —— 被拒的地址
+  根本不会被拨；黑名单里的地址也躲不到允许地址后面。留下的地址里**内网地址排在
+  前面**（稳定排序，族偏好不变），内外网同名的域名优先走内网，不从节点出口回连
+  自家公网 IP。dryrun 只判不改拨号。
 - 域名寻址 + 只配 `ip_cidrs` + 节点未开 `resolve`，结果仍然是落到 default。面板 UI
   MUST 在这种组合下引导运营补 `domain_suffixes`，或提示节点侧启用 `resolve`。
 - **xray 节点不支持解析回退**：ACL 钩子在 `Dispatch` 里，比路由更早，拿不到任何已解析
@@ -359,12 +365,8 @@ xray 的 ACL 钩子在 `Dispatch` 里，比路由更早，session 里没有任�
   "运营点了域名就以域名为准"这条默认，所以必须由运营显式表态，不能是全局开关。
 - **依赖 `acl_resolve_domains`。** 没有解析结果就没有可比的地址，规则静默不命中。面板
   MUST 在勾选此项时检查目标域名的 zone 是否已在 `acl_resolve_domains` 里，否则给出告警。
-- **多地址聚合仍然不对称，但方向按 action 分：**
-  - `deny` + `match_resolved`：**任一**解析地址落在集合里即 deny。
-  - `allow` + `match_resolved`：**全部**解析地址都得落在集合里才 allow。
-  
-  混合 DNS 应答（`[10.0.0.1, 10.0.0.50]`）因此拿不到放行 —— 内核可能拨任意一个、还会
-  故障转移，"它挑了好的那个"不是 ACL 能依赖的前提。单 A 记录的常见情况下两条规则等价。
+- **多地址逐个判定**（§3.3）：每个解析地址单独走一遍规则表。混合应答
+  `[10.0.0.1, 10.0.0.50]` 在上表规则下放行，但节点只拨 `10.0.0.1`。
 - **`match_resolved` 只扩展 `ip_cidrs`。** 规则没写 `ip_cidrs` 就是个静默无效的标记，
   节点直接拒绝整份配置（与"规则必须有至少一个匹配条件"同一立场）。
 - **xray 无效。** 和 §3.5 同一个原因：xray 的 ACL 钩子拿不到任何已解析地址。
@@ -418,6 +420,25 @@ SHOULD 给一个"按优先级展开"的只读视图：把该用户所有组的�
 模拟器若不接受这个输入，对带 `match_resolved` 的规则会给出与线上相反的结论。
 节点侧 `xbctl acl eval` 是同一套评估器的 CLI 封装，可直接用于对账。
 
+### 3.7 只按 IP 授权的策略怎么写
+
+逐地址判定（§3.3）之后，"只认指定网段、域名只用来解析"可以直接写出来：
+
+```jsonc
+{ "action": "allow", "priority": 40,  "ip_cidrs": ["10.101.0.0/16"], "match_resolved": true },
+{ "action": "deny",  "priority": 100, "ip_cidrs": ["10.0.0.0/8"],     "match_resolved": true },
+// 可选：要放行解析到公网的域名，就在内网 deny 之后放一条公网 allow
+{ "action": "allow", "priority": 150, "ip_cidrs": ["0.0.0.0/0"],      "match_resolved": true }
+```
+
+| 目标（节点解析结果） | 无 P150 | 有 P150 |
+|---|---|---|
+| `sso-gateway…` → `[183.129.228.249, 10.101.30.4]` | allow，只拨 `10.101.30.4` | allow，先拨 `10.101.30.4`、再 `183.129.228.249` |
+| `www…` → `[1.2.3.4]` | deny | allow |
+| `git…` → `[10.20.0.5]` | deny（P100） | deny（P100） |
+
+不需要为内外网同名的域名逐个登记 IP。"内网/公网"的划分写死在节点
+（`internal/acl/public.go`），只影响拨号顺序，不影响判定。
 ---
 
 ## 4. 校验规范
@@ -613,7 +634,7 @@ USR="curl -s -H 'Authorization: Bearer $T' '$P/api/v1/server/UniProxy/user?node_
 | 17 | 优先级 | 配互相冲突的两组，调 priority | 结果与 §3.3 首条命中语义一致 |
 | 17b | 域名寻址落 default | 只配 `ip_cidrs` 的 allow 规则、`acl_resolve_domains` 为空，用受限用户按**域名**访问该网段 | 判定为 deny，`acl_rule` 是 `default` 或那条兜底 deny —— 这是预期行为，不是 bug（见 §3.5） |
 | 17c | 解析回退生效 | 下发 `acl_resolve_domains: ["<该后缀>"]` 后重跑 #17b | 放行，`acl_rule` 指向那条 `ip_cidrs` 规则 |
-| 17d | 混合应答不放过 | 让该域名解析出一个段内 + 一个段外地址 | 判定为 deny（任一地址被拒即拒，见 §3.3） |
+| 17d | 混合应答只拨段内 | 让该域名解析出一个段内 + 一个段外地址 | 判定为 allow，`xbctl acl eval` 显示只拨段内地址；段外地址不会被连接（见 §3.3） |
 | 17e | 字段位置正确 | 取 config | `acl_resolve_domains` 与 `acl` **平级**，不在 `acl` 对象里面（见 §3.5） |
 | 17f | xray 明确告警 | 给 xray 节点下发 `acl_resolve_domains` | 节点日志出现 `acl_resolve_domains is not supported on this kernel` 的 Warn，而不是静默无效 |
 | 18 | 模拟器一致性 | 对 #16 #17 #17b–d 的用例跑面板模拟器 | 输出与节点实际行为逐条一致；模拟器需按内核类型区分是否有解析回退 |

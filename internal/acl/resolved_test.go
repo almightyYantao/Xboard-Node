@@ -2,6 +2,7 @@ package acl
 
 import (
 	"net/netip"
+	"slices"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/model"
@@ -48,7 +49,7 @@ func TestResolvedIPsSatisfyCIDRAllowlist(t *testing.T) {
 // One forbidden address among several denies the connection: the kernel may
 // dial any of them, so an allowlist that passed on "at least one is permitted"
 // would be trivially bypassable with a mixed DNS answer.
-func TestResolvedIPsAnyDenyWins(t *testing.T) {
+func TestResolvedIPsMixedAnswerDialsAllowedOnly(t *testing.T) {
 	s := New()
 	mustUpdate(t, s, denyByDefault(model.ACLGroup{
 		ID:    "internal",
@@ -61,14 +62,18 @@ func TestResolvedIPsAnyDenyWins(t *testing.T) {
 		Port:        443,
 		ResolvedIPs: ips("10.1.0.5", "203.0.113.9"),
 	}
-	if action, origin := p.Evaluate(dest); action != ActionDeny || origin != OriginDefault {
-		t.Errorf("mixed answer: got %v/%q, want deny/default", action, origin)
+	d := p.Decide(dest)
+	if d.Action != ActionAllow || d.Origin != "internal#0" {
+		t.Errorf("mixed answer: got %v/%q, want allow/internal#0", d.Action, d.Origin)
+	}
+	if want := ips("10.1.0.5"); !slices.Equal(d.DialOnly, want) {
+		t.Errorf("mixed answer: DialOnly = %v, want %v", d.DialOnly, want)
 	}
 }
 
-// The same asymmetry has to work for a blocklist on an allow-default node:
-// a forbidden address hiding behind permitted ones must still be caught.
-func TestResolvedIPsCatchBlocklistUnderAllowDefault(t *testing.T) {
+// A blocklist on an allow-default node: a forbidden address hiding behind
+// permitted ones is stripped from what the kernel may dial.
+func TestResolvedIPsBlocklistStripsForbiddenAddress(t *testing.T) {
 	cfg := &model.ACLConfig{
 		Mode:          "enforce",
 		DefaultAction: "allow",
@@ -86,8 +91,17 @@ func TestResolvedIPsCatchBlocklistUnderAllowDefault(t *testing.T) {
 		Port:        443,
 		ResolvedIPs: ips("1.1.1.1", "10.9.0.5"),
 	}
-	if action, origin := p.Evaluate(dest); action != ActionDeny || origin != "guard#0" {
-		t.Errorf("blocklist: got %v/%q, want deny/guard#0", action, origin)
+	d := p.Decide(dest)
+	if d.Action != ActionAllow {
+		t.Errorf("blocklist: got %v/%q, want allow", d.Action, d.Origin)
+	}
+	if want := ips("1.1.1.1"); !slices.Equal(d.DialOnly, want) {
+		t.Errorf("blocklist: DialOnly = %v, want %v — the forbidden address must never be dialed", d.DialOnly, want)
+	}
+	// Only forbidden addresses: the connection is refused.
+	only := Dest{Domain: "sneaky.example.com", Port: 443, ResolvedIPs: ips("10.9.0.5")}
+	if action, origin := p.Evaluate(only); action != ActionDeny || origin != "guard#0" {
+		t.Errorf("forbidden only: got %v/%q, want deny/guard#0", action, origin)
 	}
 }
 
@@ -285,11 +299,10 @@ func TestWithoutMatchResolvedDomainDenyStillWins(t *testing.T) {
 	}
 }
 
-// An allow has to cover every resolved address. A DNS answer mixing the
-// exempt address in with others must not buy a permit for the connection —
-// the kernel may dial any of them, and failover means "it picked the good
-// one" is not something the ACL can rely on.
-func TestMatchResolvedAllowRequiresEveryAddress(t *testing.T) {
+// Addresses are judged one by one. A DNS answer mixing the exempt address in
+// with others is allowed, but the kernel may dial only the exempt one — so a
+// mixed answer buys no permit for the other addresses.
+func TestMatchResolvedAllowDialsOnlyCoveredAddresses(t *testing.T) {
 	s := New()
 	mustUpdate(t, s, allowResolvedInsideDeniedZone(), users(user(1, "u1", "corp")))
 
@@ -298,13 +311,17 @@ func TestMatchResolvedAllowRequiresEveryAddress(t *testing.T) {
 		Port:        443,
 		ResolvedIPs: ips("10.0.0.1", "10.0.0.50"),
 	}
-	if action, origin := s.Lookup("u1").Evaluate(dest); action != ActionDeny || origin != "corp#2" {
-		t.Errorf("got %v/%q, want deny/corp#2", action, origin)
+	d := s.Lookup("u1").Decide(dest)
+	if d.Action != ActionAllow || d.Origin != "corp#0" {
+		t.Errorf("got %v/%q, want allow/corp#0", d.Action, d.Origin)
+	}
+	if want := ips("10.0.0.1"); !slices.Equal(d.DialOnly, want) {
+		t.Errorf("DialOnly = %v, want %v", d.DialOnly, want)
 	}
 }
 
-// A deny is the mirror image: one address inside the set condemns the whole
-// connection, even when the others are unremarkable.
+// A deny strips the addresses inside its set; the connection proceeds on the
+// rest, and is refused only if nothing is left.
 func TestMatchResolvedDenyMatchesAnyAddress(t *testing.T) {
 	s := New()
 	mustUpdate(t, s, &model.ACLConfig{
@@ -320,8 +337,9 @@ func TestMatchResolvedDenyMatchesAnyAddress(t *testing.T) {
 	p := s.Lookup("u1")
 
 	dest := Dest{Domain: "split.example.com", Port: 443, ResolvedIPs: ips("1.1.1.1", "10.0.0.5")}
-	if action, origin := p.Evaluate(dest); action != ActionDeny || origin != "corp#0" {
-		t.Errorf("mixed answer: got %v/%q, want deny/corp#0", action, origin)
+	d := p.Decide(dest)
+	if d.Action != ActionAllow || !slices.Equal(d.DialOnly, ips("1.1.1.1")) {
+		t.Errorf("mixed answer: got %v/%q dial=%v, want allow dialing only 1.1.1.1", d.Action, d.Origin, d.DialOnly)
 	}
 
 	// Nothing resolved into the range: the flag adds no verdict of its own.

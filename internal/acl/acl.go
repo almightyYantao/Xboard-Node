@@ -112,61 +112,133 @@ func (p *Policy) Check(dest Dest) Action {
 // Evaluate is Check plus the identity of the rule that decided the outcome,
 // for reporting which rule blocked (or would block) a connection.
 //
-// A domain target is judged by the domain rules first: an operator naming a
-// domain has stated their intent about it, so that verdict wins either way.
-// Only when no rule matched the name at all do ResolvedIPs get a turn, which
-// is what lets an ip_cidr allowlist govern domain-addressed traffic.
+// A domain target the kernel did not resolve is judged by the domain rules
+// alone; ip_cidrs cannot see it.
 //
-// A rule carrying match_resolved opts out of that split: its CIDR set is tried
-// against ResolvedIPs during the first pass, so it competes with the domain
-// rules on priority alone. That is the only way to let an allow outrank a
-// domain_suffix deny — "allow whatever resolves to this address, even inside a
-// denied zone" is otherwise inexpressible, because the deny settles the verdict
-// before the fallback can run.
-//
-// Aggregating several candidate addresses is deliberately asymmetric: the
-// kernel may dial any of them, possibly failing over, so one denied address
-// denies the connection. "Any deny wins" is the only direction that holds for
-// both rule flavours — an allowlist cannot be slipped past with a DNS answer
-// mixing one permitted address in with forbidden ones, and a blocklist still
-// catches a forbidden address hiding behind others.
+// A domain target with ResolvedIPs is judged **per address**: each address
+// runs the rule list on its own (see judgeAddr), and the connection is
+// allowed when at least one address is, with the kernel then dialing only the
+// allowed ones (Decision.DialOnly). That is what makes an ip_cidr allowlist
+// mean what it says for domain-addressed traffic: a name whose DNS answer
+// mixes a permitted internal address with an unlisted public one reaches the
+// permitted address and never the other. Judging the answer as a whole could
+// only pick between "deny the name" (a mixed answer locks the user out of a
+// service the policy allows) and "allow the name" (the kernel may fail over
+// to the address the policy does not allow).
 func (p *Policy) Evaluate(dest Dest) (Action, string) {
+	d := p.Decide(dest)
+	return d.Action, d.Origin
+}
+
+// Decision is a verdict plus the constraint the dialer must honour for it.
+type Decision struct {
+	Action Action
+	Origin string
+	// DialOnly, when non-nil, is the list of addresses the kernel may dial, in
+	// the order to try them. It is set only for an allowed domain target whose
+	// resolved addresses were narrowed (some denied) or reordered (internal
+	// addresses first — see preferInternal). nil means dial as resolved.
+	DialOnly []netip.Addr
+}
+
+// Decide is Evaluate plus the dial constraint.
+func (p *Policy) Decide(dest Dest) Decision {
 	if p == nil {
-		return ActionAllow, OriginDefault
+		return Decision{Action: ActionAllow, Origin: OriginDefault}
 	}
-	action, origin := p.match(dest)
-	if origin != OriginDefault || dest.Domain == "" || len(dest.ResolvedIPs) == 0 {
-		return action, origin
+	if dest.Domain == "" || len(dest.ResolvedIPs) == 0 {
+		action, origin := p.match(dest)
+		return Decision{Action: action, Origin: origin}
 	}
 
-	// The name matched nothing. Fall back to the addresses the kernel resolved
-	// it to, which is the node's own DNS view of the target.
-	probe := dest
-	probe.Domain = ""
-	probe.ResolvedIPs = nil
-	fallback := OriginDefault
-	for _, ip := range dest.ResolvedIPs {
-		probe.IP = ip.Unmap()
-		a, o := p.match(probe)
-		if a == ActionDeny {
-			return ActionDeny, o
-		}
-		if fallback == OriginDefault {
-			fallback = o
+	var buf [8]bool
+	allowed := buf[:0]
+	nAllowed := 0
+	denyOrigin := ""
+	for i := range dest.ResolvedIPs {
+		action, origin := p.judgeAddr(dest, i)
+		ok := action == ActionAllow
+		allowed = append(allowed, ok)
+		if ok {
+			nAllowed++
+		} else if denyOrigin == "" || denyOrigin == OriginDefault {
+			// Report a named rule over the default when there is one: "which
+			// rule blocked this" is the question the report answers.
+			denyOrigin = origin
 		}
 	}
-	return ActionAllow, fallback
+	if nAllowed == 0 {
+		return Decision{Action: ActionDeny, Origin: denyOrigin}
+	}
+
+	dial := dest.ResolvedIPs
+	if nAllowed < len(dial) || !internalFirst(dial) {
+		dial = make([]netip.Addr, 0, nAllowed)
+		for i, ip := range dest.ResolvedIPs {
+			if allowed[i] {
+				dial = append(dial, ip)
+			}
+		}
+		preferInternal(dial)
+	} else {
+		dial = nil
+	}
+
+	first := dest.ResolvedIPs[0]
+	if dial != nil {
+		first = dial[0]
+	}
+	_, origin := p.judgeAddr(dest, indexOf(dest.ResolvedIPs, first))
+	return Decision{Action: ActionAllow, Origin: origin, DialOnly: dial}
+}
+
+// judgeAddr runs the rule list for the i-th resolved address of a domain
+// target.
+//
+// First pass: the name plus this one address — domain and suffix rules match
+// on the name, match_resolved rules on the address, so they compete on
+// priority. Only if nothing matched does the address get a pass on its own as
+// an IP target, which is what lets a plain ip_cidr rule (without
+// match_resolved) govern a resolved name. Same two passes as before per-address
+// judging, just per address.
+func (p *Policy) judgeAddr(dest Dest, i int) (Action, string) {
+	probe := dest
+	probe.ResolvedIPs = dest.ResolvedIPs[i : i+1]
+	if r := p.matchRule(probe); r != nil {
+		return r.action, r.origin
+	}
+	probe.Domain = ""
+	probe.ResolvedIPs = nil
+	probe.IP = dest.ResolvedIPs[i].Unmap()
+	return p.match(probe)
+}
+
+func indexOf(ips []netip.Addr, ip netip.Addr) int {
+	for i, x := range ips {
+		if x == ip {
+			return i
+		}
+	}
+	return 0
 }
 
 // match runs the rule list once, returning the first matching rule's action or
 // the policy default when nothing matches.
 func (p *Policy) match(dest Dest) (Action, string) {
-	for i := range p.rules {
-		if p.rules[i].matches(dest) {
-			return p.rules[i].action, p.rules[i].origin
-		}
+	if r := p.matchRule(dest); r != nil {
+		return r.action, r.origin
 	}
 	return p.def, OriginDefault
+}
+
+// matchRule returns the first matching rule, or nil.
+func (p *Policy) matchRule(dest Dest) *rule {
+	for i := range p.rules {
+		if p.rules[i].matches(dest) {
+			return &p.rules[i]
+		}
+	}
+	return nil
 }
 
 // DryRun reports whether a denial should be logged rather than enforced.
@@ -266,31 +338,18 @@ func (r *rule) matchDest(d Dest) bool {
 }
 
 // matchResolvedIPs tests an opt-in rule's CIDR set against the addresses the
-// kernel resolved a domain target to.
-//
-// The aggregation is asymmetric for the same reason Policy.Evaluate's fallback
-// is: the kernel may dial any of these addresses and may fail over between
-// them, so one address in a deny set condemns the connection, while an allow
-// has to cover every address — otherwise a DNS answer that mixes one permitted
-// address in with forbidden ones would buy a permit for all of them.
+// kernel resolved a domain target to. Policy.Decide hands it one address at a
+// time, so there is no aggregation to decide here.
 func (r *rule) matchResolvedIPs(ips []netip.Addr) bool {
-	if !r.matchResolved || r.ips == nil || len(ips) == 0 {
-		return false
-	}
-	if r.action == ActionDeny {
-		for _, ip := range ips {
-			if r.ips.Contains(ip.Unmap()) {
-				return true
-			}
-		}
+	if !r.matchResolved || r.ips == nil {
 		return false
 	}
 	for _, ip := range ips {
-		if !r.ips.Contains(ip.Unmap()) {
-			return false
+		if r.ips.Contains(ip.Unmap()) {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 // matchSuffix reports whether host equals or is a subdomain of any entry.

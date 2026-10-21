@@ -1280,6 +1280,17 @@ func (s *Service) triggerSelfUpdate(targetVersion string) { TriggerSelfUpdate(ta
 
 // TriggerSelfUpdate 是上面那段的包级入口，机器编排器（它没有 Service）也要用。
 func TriggerSelfUpdate(targetVersion string) {
+	// 自更新依赖 systemd（systemd-run 脱离 cgroup、xbctl upgrade 里 systemctl restart）。
+	// 版本由外部管理（LB_NODE_SELF_UPDATE=0，如 Tunnova 插件自己下载 / 校验内核）或者机器上
+	// 根本没有 systemd（procd 等）时不升级：每个目标版本只提示一次，不再每个上报周期报 ERROR。
+	if selfUpdateDisabled() {
+		noteUpdateTarget(targetVersion, "self-update disabled, version is managed externally")
+		return
+	}
+	if _, err := exec.LookPath("systemd-run"); err != nil {
+		noteUpdateTarget(targetVersion, "self-update unavailable: systemd-run not found")
+		return
+	}
 	if !globalSelfUpdate.CompareAndSwap(false, true) {
 		return
 	}
@@ -1300,6 +1311,40 @@ func TriggerSelfUpdate(targetVersion string) {
 	}
 	// 不 Wait：升级进程在独立 scope 里跑，会重启本服务（本进程随之退出）
 	_ = cmd.Process.Release()
+}
+
+// selfUpdateDisabled reports whether LB_NODE_SELF_UPDATE turns panel-driven
+// self-update off ("0", "off", "false", "no", "disabled").
+func selfUpdateDisabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("LB_NODE_SELF_UPDATE"))) {
+	case "0", "off", "false", "no", "disabled":
+		return true
+	}
+	return false
+}
+
+var (
+	updateNoticeMu   sync.Mutex
+	updateNoticeLast string
+)
+
+// noteUpdateTarget logs (once per target version) that the panel asked for an
+// upgrade we won't perform, and writes the target to LB_NODE_UPDATE_HINT_FILE
+// (if set) so whatever manages the binary can offer the update.
+func noteUpdateTarget(target, msg string) {
+	updateNoticeMu.Lock()
+	defer updateNoticeMu.Unlock()
+	if target == updateNoticeLast {
+		return
+	}
+	updateNoticeLast = target
+	nlog.Core().Info(msg, "current", agentVersion, "panel_target", target)
+	if f := strings.TrimSpace(os.Getenv("LB_NODE_UPDATE_HINT_FILE")); f != "" {
+		tmp := f + ".tmp"
+		if err := os.WriteFile(tmp, []byte(target+"\n"), 0o644); err == nil {
+			_ = os.Rename(tmp, f)
+		}
+	}
 }
 
 // buildMetrics aggregates node-level metrics to be reported to the panel.

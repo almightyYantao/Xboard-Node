@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -369,17 +370,24 @@ func (t *ConnTracker) ACLDenials() uint64 { return t.aclDenials.Load() }
 // aclRejects reports whether the user's policy forbids this destination, and
 // records the denial for the panel either way.
 //
+// dialOnly is non-nil when the connection is allowed on condition that the
+// kernel dials only those addresses (a resolved name whose answer was narrowed or reordered). The
+// tracker cannot change what sing-box dials — the router hands it a copy of
+// the metadata — so the constraint travels on the wrapped conn to the direct
+// outbound, which applies it (see aclDirectOutbound). Never set in dry-run:
+// dry-run must not change what traffic does.
+//
 // sing-box calls the tracker after routing has picked an outbound, so the
 // only way to refuse is to close the connection. That is the same mechanism
 // the device-limit gate already uses.
-func (t *ConnTracker) aclRejects(uuid string, userID int, sourceIP string, metadata adapter.InboundContext, udp bool) bool {
+func (t *ConnTracker) aclRejects(uuid string, userID int, sourceIP string, metadata adapter.InboundContext, udp bool) (reject bool, dialOnly []netip.Addr) {
 	fn := t.aclFunc.Load()
 	if fn == nil {
-		return false
+		return false, nil
 	}
 	policy := (*fn)(uuid)
 	if !policy.Restricted() {
-		return false
+		return false, nil
 	}
 
 	dest := acl.Dest{Port: metadata.Destination.Port, UDP: udp}
@@ -395,9 +403,16 @@ func (t *ConnTracker) aclRejects(uuid string, userID int, sourceIP string, metad
 		dest.IP = addr.Unmap()
 	}
 
-	action, origin := policy.Evaluate(dest)
+	decision := policy.Decide(dest)
+	action, origin := decision.Action, decision.Origin
 	if action == acl.ActionAllow {
-		return false
+		if decision.DialOnly == nil || policy.DryRun() {
+			return false, nil
+		}
+		nlog.Core().Debug("singbox: acl narrows dial addresses",
+			"user", uuid, "dest", metadata.Destination.String(), "rule", origin,
+			"dial", decision.DialOnly)
+		return false, decision.DialOnly
 	}
 
 	t.aclDenials.Add(1)
@@ -406,11 +421,11 @@ func (t *ConnTracker) aclRejects(uuid string, userID int, sourceIP string, metad
 	if policy.DryRun() {
 		nlog.Core().Info("singbox: acl would deny (dryrun)",
 			"user", uuid, "dest", metadata.Destination.String(), "rule", origin)
-		return false
+		return false, nil
 	}
 	nlog.Core().Debug("singbox: acl denied",
 		"user", uuid, "dest", metadata.Destination.String(), "rule", origin)
-	return true
+	return true, nil
 }
 
 // recordACLDenial buffers an ACL verdict for the next panel push.
@@ -494,7 +509,8 @@ func (t *ConnTracker) RoutedConnection(
 	t.usersMu.RUnlock()
 
 	// ACL first: a forbidden destination should not burn a device slot.
-	if t.aclRejects(uuid, uid, sourceIP, metadata, false) {
+	reject, dialOnly := t.aclRejects(uuid, uid, sourceIP, metadata, false)
+	if reject {
 		conn.Close()
 		return conn
 	}
@@ -539,6 +555,7 @@ func (t *ConnTracker) RoutedConnection(
 		sourceIP: sourceIP,
 		limiter:  lim,
 		ctx:      ctx,
+		dialOnly: dialOnly,
 	}
 	// 仅在开启访问日志时才提取目标/记录起始时间，关闭时无额外开销
 	if t.accessEnabled.Load() {
@@ -565,7 +582,8 @@ func (t *ConnTracker) RoutedPacketConnection(
 	t.usersMu.RUnlock()
 
 	// ACL first: a forbidden destination should not burn a device slot.
-	if t.aclRejects(uuid, uid, sourceIP, metadata, true) {
+	reject, dialOnly := t.aclRejects(uuid, uid, sourceIP, metadata, true)
+	if reject {
 		conn.Close()
 		return conn
 	}
@@ -609,6 +627,7 @@ func (t *ConnTracker) RoutedPacketConnection(
 		sourceIP:   sourceIP,
 		limiter:    lim,
 		ctx:        ctx,
+		dialOnly:   dialOnly,
 	}
 	if t.accessEnabled.Load() {
 		tc.destHost, tc.destPort = destFromMeta(metadata)
@@ -916,6 +935,8 @@ type trackedConn struct {
 	limiter  *rate.Limiter
 	ctx      context.Context
 	closed   atomic.Bool
+	// dialOnly is the ACL's dial constraint; see aclRejects.
+	dialOnly []netip.Addr
 
 	// access logging (per-connection)
 	destHost   string
@@ -1071,6 +1092,8 @@ type trackedPacketConn struct {
 	limiter  *rate.Limiter
 	ctx      context.Context
 	closed   atomic.Bool
+	// dialOnly is the ACL's dial constraint; see aclRejects.
+	dialOnly []netip.Addr
 
 	// access logging (per-connection)
 	destHost   string

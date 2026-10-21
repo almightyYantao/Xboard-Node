@@ -147,6 +147,9 @@ type aclEvalResult struct {
 	Rule     string `json:"rule"`
 	Enforced bool   `json:"enforced"`
 	Note     string `json:"note,omitempty"`
+	// DialOnly is set when the resolved addresses were narrowed or reordered:
+	// the node (in enforce mode) dials these, in this order, and no others.
+	DialOnly []string `json:"dial_only,omitempty"`
 }
 
 func runACLEval(args []string) error {
@@ -192,7 +195,12 @@ func runACLEval(args []string) error {
 		if err != nil {
 			return err
 		}
-		action, origin := policy.Evaluate(dest)
+		decision := policy.Decide(dest)
+		action, origin := decision.Action, decision.Origin
+		var dialOnly []string
+		for _, ip := range decision.DialOnly {
+			dialOnly = append(dialOnly, ip.String())
+		}
 		proto := "tcp"
 		if dest.UDP {
 			proto = "udp"
@@ -205,6 +213,7 @@ func runACLEval(args []string) error {
 			Rule:     origin,
 			Enforced: action == acl.ActionDeny && !policy.DryRun(),
 			Note:     resolveCoverageNote(dest, spec.ACLResolveDomains),
+			DialOnly: dialOnly,
 		})
 	}
 
@@ -463,6 +472,9 @@ func printACLEvalResults(spec *model.NodeSpec, policy *acl.Policy, users []model
 	fmt.Printf("%-*s  %-5s  %-5s  %-7s  %s\n", width, "TARGET", "PORT", "PROTO", "VERDICT", "RULE")
 	for _, r := range results {
 		fmt.Printf("%-*s  %-5d  %-5s  %-7s  %s\n", width, r.Target, r.Port, r.Proto, r.Verdict, r.Rule)
+		if len(r.DialOnly) > 0 {
+			fmt.Printf("%-*s  dials only, in order: %s\n", width, "", strings.Join(r.DialOnly, ", "))
+		}
 	}
 
 	notes := map[string][]string{}
